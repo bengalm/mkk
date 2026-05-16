@@ -33,3 +33,6 @@ config.yaml
 mkk.log
 mkk.db
 mkk
+mkk.db-shm
+mkk.db-wal
+ai_signal.json

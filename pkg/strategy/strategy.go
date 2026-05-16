@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/bengalm/mkk/pkg/eventbus"
@@ -91,6 +92,9 @@ func (b *BaseStrategy) Stop() {
 // Exchange returns the exchange client.
 func (b *BaseStrategy) Exchange() exchange.Exchange { return b.exchange }
 
+// GetBus returns the event bus.
+func (b *BaseStrategy) GetBus() *eventbus.EventBus { return b.bus }
+
 // Signals returns the signal channel.
 func (b *BaseStrategy) Signals() <-chan TradeSignal { return b.signals }
 
@@ -151,6 +155,22 @@ func GetStringParam(config map[string]interface{}, key string, defaultVal string
 	}
 	if s, ok := val.(string); ok {
 		return s
+	}
+	return defaultVal
+}
+
+// GetBoolParam extracts a bool parameter from config.
+func GetBoolParam(config map[string]interface{}, key string, defaultVal bool) bool {
+	val, ok := config[key]
+	if !ok {
+		return defaultVal
+	}
+	if b, ok := val.(bool); ok {
+		return b
+	}
+	// Handle YAML "1"/"0" or "true"/"false" strings
+	if s, ok := val.(string); ok {
+		return strings.EqualFold(s, "true") || s == "1"
 	}
 	return defaultVal
 }

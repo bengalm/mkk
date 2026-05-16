@@ -1,0 +1,8 @@
+{
+  "direction": "short",
+  "confidence": 0.7,
+  "reason": "EMA空头排列，SOL持续下跌趋势，短线偏空",
+  "timestamp": "2026-05-16T23:30:00Z",
+  "price_target": 82.0,
+  "stop_hint": 92.0
+}

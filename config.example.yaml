@@ -1,0 +1,56 @@
+# MKK Configuration
+# Copy this to config.yaml and fill in your API keys
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+exchange:
+  name: "okx"
+  api_key: "YOUR_OKX_API_KEY"
+  secret_key: "YOUR_OKX_SECRET_KEY"
+  passphrase: "YOUR_OKX_PASSPHRASE"
+  testnet: false  # Set to true for testnet
+
+strategy:
+  active: "rsi"  # Default strategy: grid, dca, rsi
+  params:
+    rsi:
+      pair: "BTC-USDT"
+      timeframe: "1h"
+      period: 14
+      overbought: 70
+      oversold: 30
+      take_profit: 0.05
+      stop_loss: 0.03
+      long_short: true
+      amount: 0.001
+    grid:
+      pair: "BTC-USDT"
+      upper_price: 80000
+      lower_price: 50000
+      grids: 20
+      amount: 0.001
+    dca:
+      pair: "BTC-USDT"
+      interval: "24h"
+      amount: 100
+      take_profit: 0.10
+      max_orders: 10
+
+risk:
+  max_position_size: 100    # USDT
+  max_daily_loss: 30        # USDT
+  max_drawdown_pct: 15      # %
+  max_open_positions: 3
+  default_leverage: 5
+  min_risk_reward: 2.0
+
+logging:
+  level: "info"      # debug, info, warn, error
+  format: "console"  # console, json
+
+database:
+  path: "mkk.db"
+
+paper: true  # Set to false for live trading

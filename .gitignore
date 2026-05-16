@@ -29,3 +29,7 @@ Thumbs.db
 
 # Vendor (optional)
 vendor/
+config.yaml
+mkk.log
+mkk.db
+mkk

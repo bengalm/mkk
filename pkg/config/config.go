@@ -16,6 +16,7 @@ type Config struct {
 	Database DatabaseConfig `yaml:"database"`
 	Paper    bool           `yaml:"paper"`
 	Risk     RiskConfig     `yaml:"risk"`
+	Notifier NotifierConfig `yaml:"notifier"`
 }
 
 // RiskConfig holds risk management parameters for live trading.
@@ -62,6 +63,18 @@ type LoggingConfig struct {
 // DatabaseConfig holds database settings.
 type DatabaseConfig struct {
 	Path string `yaml:"path"`
+}
+
+// NotifierConfig holds notification settings.
+type NotifierConfig struct {
+	Type     string `yaml:"type"`      // "telegram"
+	BotToken string `yaml:"bot_token"` // Telegram bot token
+	ChatID   string `yaml:"chat_id"`   // Telegram chat ID
+}
+
+// Enabled returns true if notifier is configured.
+func (n NotifierConfig) Enabled() bool {
+	return n.Type != "" && n.BotToken != "" && n.ChatID != ""
 }
 
 // DefaultConfig returns a config with sensible defaults.

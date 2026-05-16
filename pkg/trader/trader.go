@@ -9,18 +9,19 @@ import (
 	"github.com/bengalm/mkk/pkg/eventbus"
 	"github.com/bengalm/mkk/pkg/exchange"
 	"github.com/bengalm/mkk/pkg/exchange/okx"
+	"github.com/bengalm/mkk/pkg/repository"
 	"github.com/bengalm/mkk/pkg/strategy"
 	"github.com/rs/zerolog/log"
 )
 
 // RiskConfig holds risk management parameters.
 type RiskConfig struct {
-	MaxPositionSize  float64 `yaml:"max_position_size"`   // max USDT per position
-	MaxDailyLoss     float64 `yaml:"max_daily_loss"`      // max daily loss in USDT
-	MaxDrawdownPct   float64 `yaml:"max_drawdown_pct"`    // max drawdown percentage
-	MaxOpenPositions int     `yaml:"max_open_positions"`  // max concurrent positions
-	DefaultLeverage  int     `yaml:"default_leverage"`    // default leverage
-	MinRiskReward    float64 `yaml:"min_risk_reward"`     // minimum R:R ratio
+	MaxPositionSize  float64 `yaml:"max_position_size"`
+	MaxDailyLoss     float64 `yaml:"max_daily_loss"`
+	MaxDrawdownPct   float64 `yaml:"max_drawdown_pct"`
+	MaxOpenPositions int     `yaml:"max_open_positions"`
+	DefaultLeverage  int     `yaml:"default_leverage"`
+	MinRiskReward    float64 `yaml:"min_risk_reward"`
 }
 
 // DefaultRiskConfig returns sensible defaults.
@@ -35,12 +36,22 @@ func DefaultRiskConfig() RiskConfig {
 	}
 }
 
+// Notifier is the interface for sending notifications.
+type Notifier interface {
+	NotifyTrade(pair, side string, price, amount float64) error
+	NotifyPnL(pair string, pnl float64) error
+	NotifyError(context string, errMsg string) error
+	NotifyRiskAlert(message string) error
+}
+
 // Engine is the live trading engine.
 type Engine struct {
 	exchange  exchange.Exchange
 	bus       *eventbus.EventBus
 	manager   *strategy.Manager
 	risk      RiskConfig
+	repo      *repository.Repository
+	notifier  Notifier
 	positions map[string]*ManagedPosition
 	mu        sync.RWMutex
 	running   bool
@@ -67,12 +78,17 @@ type ManagedPosition struct {
 }
 
 // NewEngine creates a new trading engine.
-func NewEngine(ex exchange.Exchange, bus *eventbus.EventBus, risk RiskConfig) *Engine {
+func NewEngine(ex exchange.Exchange, bus *eventbus.EventBus, risk RiskConfig, repo *repository.Repository, n Notifier) *Engine {
+	if n == nil {
+		n = noopNotifier{}
+	}
 	return &Engine{
 		exchange:      ex,
 		bus:           bus,
 		manager:       strategy.NewManager(),
 		risk:          risk,
+		repo:          repo,
+		notifier:      n,
 		positions:     make(map[string]*ManagedPosition),
 		quit:          make(chan struct{}),
 		dailyReset:    time.Now().Truncate(24 * time.Hour),
@@ -81,6 +97,14 @@ func NewEngine(ex exchange.Exchange, bus *eventbus.EventBus, risk RiskConfig) *E
 	}
 }
 
+// noopNotifier is used when no notifier is configured.
+type noopNotifier struct{}
+
+func (noopNotifier) NotifyTrade(string, string, float64, float64) error { return nil }
+func (noopNotifier) NotifyPnL(string, float64) error                    { return nil }
+func (noopNotifier) NotifyError(string, string) error                   { return nil }
+func (noopNotifier) NotifyRiskAlert(string) error                       { return nil }
+
 // AddStrategy adds a strategy to the engine.
 func (e *Engine) AddStrategy(s strategy.Strategy, config map[string]interface{}) error {
 	if err := s.Init(config, e.exchange, e.bus); err != nil {
@@ -88,7 +112,6 @@ func (e *Engine) AddStrategy(s strategy.Strategy, config map[string]interface{})
 	}
 	e.manager.Add(s)
 
-	// Start listening for signals
 	go e.consumeSignals(s)
 
 	log.Info().Str("strategy", s.Name()).Msg("Strategy added to trading engine")
@@ -97,6 +120,39 @@ func (e *Engine) AddStrategy(s strategy.Strategy, config map[string]interface{})
 
 // Start starts the trading engine.
 func (e *Engine) Start() error {
+	// Restore positions from repository
+	if e.repo != nil {
+		positions, err := e.repo.GetOpenPositions()
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to restore positions from repository")
+		} else {
+			for _, p := range positions {
+				pair, _ := p["pair"].(string)
+				side, _ := p["side"].(string)
+				strategy, _ := p["strategy"].(string)
+				entryPrice, _ := p["entry_price"].(float64)
+				amount, _ := p["amount"].(float64)
+				stopLoss, _ := p["stop_loss"].(float64)
+				takeProfit, _ := p["take_profit"].(float64)
+				orderID, _ := p["order_id"].(string)
+				mp := &ManagedPosition{
+					Strategy:   strategy,
+					Pair:       pair,
+					Side:       exchange.OrderSide(side),
+					EntryPrice: entryPrice,
+					Amount:     amount,
+					StopLoss:   stopLoss,
+					TakeProfit: takeProfit,
+					OrderID:    orderID,
+				}
+				e.positions[pair] = mp
+			}
+			if len(e.positions) > 0 {
+				log.Info().Int("count", len(e.positions)).Msg("Restored positions from repository")
+			}
+		}
+	}
+
 	// Get initial balance
 	balances, err := e.exchange.GetBalance("USDT")
 	if err != nil {
@@ -115,7 +171,6 @@ func (e *Engine) Start() error {
 		Float64("equity", e.initialEquity).
 		Msg("Trading engine started")
 
-	// Start signal processing loop
 	go e.run()
 
 	return nil
@@ -175,9 +230,9 @@ func (e *Engine) processSignal(sig strategy.TradeSignal) {
 		Str("strategy", sig.Strategy).
 		Msg("Processing signal")
 
-	// Pre-trade risk check
 	if !e.checkPreTrade(sig) {
 		log.Warn().Str("pair", sig.Pair).Msg("Signal rejected by risk check")
+		e.notifier.NotifyRiskAlert(fmt.Sprintf("Signal rejected for %s: risk check failed (%s)", sig.Pair, sig.Strategy))
 		return
 	}
 
@@ -193,7 +248,6 @@ func (e *Engine) processSignal(sig strategy.TradeSignal) {
 
 // checkPreTrade validates a signal against risk rules.
 func (e *Engine) checkPreTrade(sig strategy.TradeSignal) bool {
-	// Check daily loss limit
 	if e.dailyPnL <= -e.risk.MaxDailyLoss {
 		log.Warn().
 			Float64("daily_loss", e.dailyPnL).
@@ -202,7 +256,6 @@ func (e *Engine) checkPreTrade(sig strategy.TradeSignal) bool {
 		return false
 	}
 
-	// Check max open positions
 	e.mu.RLock()
 	openCount := len(e.positions)
 	e.mu.RUnlock()
@@ -217,7 +270,6 @@ func (e *Engine) checkPreTrade(sig strategy.TradeSignal) bool {
 		}
 	}
 
-	// Check position size
 	cost := sig.Amount * sig.Price
 	if cost > e.risk.MaxPositionSize {
 		log.Warn().
@@ -227,7 +279,6 @@ func (e *Engine) checkPreTrade(sig strategy.TradeSignal) bool {
 		return false
 	}
 
-	// Check risk/reward ratio
 	if sig.StopLoss > 0 && sig.TakeProfit > 0 {
 		risk := math.Abs(sig.Price - sig.StopLoss)
 		reward := math.Abs(sig.TakeProfit - sig.Price)
@@ -253,7 +304,6 @@ func (e *Engine) openPosition(sig strategy.TradeSignal) {
 		side = exchange.Sell
 	}
 
-	// Set leverage before opening (OKX swap contracts)
 	if okxEx, ok := e.exchange.(*okx.OKXExchange); ok {
 		if err := okxEx.SetLeverage(sig.Pair, e.risk.DefaultLeverage, "isolated"); err != nil {
 			log.Warn().Err(err).Str("pair", sig.Pair).Msg("Failed to set leverage (may already be set)")
@@ -280,6 +330,7 @@ func (e *Engine) openPosition(sig strategy.TradeSignal) {
 				"signal": sig,
 			})
 		}
+		e.notifier.NotifyError("place_order", fmt.Sprintf("Failed to place order for %s: %v", sig.Pair, err))
 		return
 	}
 
@@ -309,6 +360,9 @@ func (e *Engine) openPosition(sig strategy.TradeSignal) {
 	if e.bus != nil {
 		e.bus.Publish(eventbus.TopicPosition, pos)
 	}
+
+	// Send notification
+	e.notifier.NotifyTrade(sig.Pair, string(side), sig.Price, sig.Amount)
 }
 
 // closePositionFromSignal closes a position based on signal.
@@ -323,7 +377,6 @@ func (e *Engine) closePositionFromSignal(sig strategy.TradeSignal) {
 	delete(e.positions, sig.Pair)
 	e.mu.Unlock()
 
-	// Place close order
 	closeSide := exchange.Sell
 	if pos.Side == exchange.Sell {
 		closeSide = exchange.Buy
@@ -338,6 +391,7 @@ func (e *Engine) closePositionFromSignal(sig strategy.TradeSignal) {
 	})
 	if err != nil {
 		log.Error().Err(err).Str("pair", sig.Pair).Msg("Failed to close position")
+		e.notifier.NotifyError("close_position", fmt.Sprintf("Failed to close %s: %v", sig.Pair, err))
 		return
 	}
 
@@ -349,6 +403,13 @@ func (e *Engine) closePositionFromSignal(sig strategy.TradeSignal) {
 	}
 
 	e.dailyPnL += pnl
+
+	// Delete position from repository
+	if e.repo != nil {
+		if err := e.repo.DeletePosition(pos.Pair); err != nil {
+			log.Error().Err(err).Str("pair", pos.Pair).Msg("Failed to delete position from repository")
+		}
+	}
 
 	log.Info().
 		Str("pair", sig.Pair).
@@ -363,6 +424,9 @@ func (e *Engine) closePositionFromSignal(sig strategy.TradeSignal) {
 			"price": sig.Price,
 		})
 	}
+
+	// Send notification
+	e.notifier.NotifyPnL(sig.Pair, pnl)
 }
 
 // checkRiskLimits monitors drawdown.
@@ -394,6 +458,8 @@ func (e *Engine) checkRiskLimits() {
 			Float64("drawdown", drawdown).
 			Float64("max", e.risk.MaxDrawdownPct).
 			Msg("Max drawdown exceeded! Stopping engine")
+
+		e.notifier.NotifyRiskAlert(fmt.Sprintf("Max drawdown exceeded: %.2f%% (limit: %.2f%%)", drawdown, e.risk.MaxDrawdownPct))
 		e.Stop()
 	}
 }
@@ -427,11 +493,11 @@ func (e *Engine) GetStats() map[string]interface{} {
 	defer e.mu.RUnlock()
 
 	return map[string]interface{}{
-		"running":         e.running,
-		"open_positions":  len(e.positions),
-		"daily_pnl":       math.Round(e.dailyPnL*100) / 100,
-		"peak_equity":     e.peakEquity,
-		"initial_equity":  e.initialEquity,
-		"strategies":      e.manager.List(),
+		"running":        e.running,
+		"open_positions": len(e.positions),
+		"daily_pnl":      math.Round(e.dailyPnL*100) / 100,
+		"peak_equity":    e.peakEquity,
+		"initial_equity": e.initialEquity,
+		"strategies":     e.manager.List(),
 	}
 }

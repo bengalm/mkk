@@ -8,6 +8,7 @@ import (
 
 	"github.com/bengalm/mkk/pkg/eventbus"
 	"github.com/bengalm/mkk/pkg/exchange"
+	"github.com/bengalm/mkk/pkg/exchange/okx"
 	"github.com/bengalm/mkk/pkg/strategy"
 	"github.com/rs/zerolog/log"
 )
@@ -250,6 +251,13 @@ func (e *Engine) openPosition(sig strategy.TradeSignal) {
 	side := exchange.Buy
 	if sig.Action == strategy.ActionSell {
 		side = exchange.Sell
+	}
+
+	// Set leverage before opening (OKX swap contracts)
+	if okxEx, ok := e.exchange.(*okx.OKXExchange); ok {
+		if err := okxEx.SetLeverage(sig.Pair, e.risk.DefaultLeverage, "isolated"); err != nil {
+			log.Warn().Err(err).Str("pair", sig.Pair).Msg("Failed to set leverage (may already be set)")
+		}
 	}
 
 	orderReq := exchange.OrderRequest{

@@ -340,6 +340,45 @@ func (o *OKXExchange) GetPositions(pairs ...string) ([]exchange.Position, error)
 	return result, nil
 }
 
+// SetLeverage sets leverage for a swap instrument (isolated mode).
+// It accepts a pair name (e.g. "SOL-USDT-SWAP") and converts it internally.
+func (o *OKXExchange) SetLeverage(pair string, lever int, mgnMode string) error {
+	instID := convertPair(pair)
+	if mgnMode == "" {
+		mgnMode = "isolated"
+	}
+	body := map[string]interface{}{
+		"instId":  instID,
+		"lever":   fmt.Sprintf("%d", lever),
+		"mgnMode": mgnMode,
+	}
+	_, err := o.request("POST", "/api/v5/account/set-leverage", body)
+	return err
+}
+
+// PlaceAlgoOrder places an algo order (stop-loss, take-profit, oco, etc).
+func (o *OKXExchange) PlaceAlgoOrder(params map[string]interface{}) (string, error) {
+	data, err := o.request("POST", "/api/v5/trade/order-algo", params)
+	if err != nil {
+		return "", err
+	}
+	var result []struct {
+		AlgoID string `json:"algoId"`
+		SCode  string `json:"sCode"`
+		SMsg   string `json:"sMsg"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("parse algo order response: %w", err)
+	}
+	if len(result) == 0 {
+		return "", fmt.Errorf("empty algo order response")
+	}
+	if result[0].SCode != "0" {
+		return "", fmt.Errorf("algo order rejected: %s", result[0].SMsg)
+	}
+	return result[0].AlgoID, nil
+}
+
 // PlaceOrder places a new order.
 func (o *OKXExchange) PlaceOrder(req exchange.OrderRequest) (*exchange.Order, error) {
 	instID := convertPair(req.Pair)
@@ -347,20 +386,35 @@ func (o *OKXExchange) PlaceOrder(req exchange.OrderRequest) (*exchange.Order, er
 	if side == "buy" {
 		side = "buy"
 	}
-_ordType := string(req.Type)
+	_ordType := string(req.Type)
+
+	tdMode := "cross"
+	posSide := "net"
+	if req.TdMode != "" {
+		tdMode = req.TdMode
+	} else if strings.HasSuffix(instID, "-SWAP") || strings.HasSuffix(instID, "-FUTURES") {
+		tdMode = "isolated"
+	}
+	if req.PosSide != "" {
+		posSide = req.PosSide
+	}
 
 	body := map[string]interface{}{
 		"instId":  instID,
-		"tdMode":  "cross", // cross margin
+		"tdMode":  tdMode,
 		"side":    side,
 		"ordType": _ordType,
 		"sz":      fmt.Sprintf("%.8f", req.Amount),
+		"posSide": posSide,
 	}
 	if req.Price > 0 {
 		body["px"] = fmt.Sprintf("%.8f", req.Price)
 	}
 	if req.ClientID != "" {
 		body["clOrdId"] = req.ClientID
+	}
+	if req.ReduceOnly {
+		body["reduceOnly"] = true
 	}
 
 	data, err := o.request("POST", "/api/v5/trade/order", body)

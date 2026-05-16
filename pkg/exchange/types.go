@@ -147,6 +147,8 @@ type OrderRequest struct {
 	StopPrice  float64   `json:"stop_price,omitempty"`
 	ReduceOnly bool      `json:"reduce_only,omitempty"`
 	ClientID   string    `json:"client_id,omitempty"`
+	TdMode     string    `json:"td_mode,omitempty"`  // "cross", "isolated", "cash"
+	PosSide    string    `json:"pos_side,omitempty"` // "long", "short", "net" (for hedge mode)
 }
 
 // CandleRequest is used to request candle data.

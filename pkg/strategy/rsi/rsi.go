@@ -27,9 +27,16 @@ type RSIStrategy struct {
 	longShort  bool // true = both directions, false = long only
 	amount     float64
 
-	candles    []exchange.Candle
-	rsiValues  []float64
-	position   *openPosition
+	useATR    bool    // use ATR for SL/TP
+	atrPeriod int     // ATR period
+	atrSLMult float64 // SL = ATR * multiplier
+	atrTPMult float64 // TP = ATR * multiplier
+	posUSDT   float64 // position size in USDT
+	leverage  int     // leverage
+
+	candles   []exchange.Candle
+	rsiValues []float64
+	position  *openPosition
 }
 
 type openPosition struct {
@@ -54,6 +61,12 @@ func (r *RSIStrategy) Init(config map[string]interface{}, ex exchange.Exchange, 
 	r.stopLoss = strategy.GetFloatParam(config, "stop_loss", 0.03)
 	r.longShort = strategy.GetFloatParam(config, "long_short", 1) > 0
 	r.amount = strategy.GetFloatParam(config, "amount", 0.01)
+	r.useATR = strategy.GetFloatParam(config, "use_atr", 1) > 0
+	r.atrPeriod = strategy.GetIntParam(config, "atr_period", 14)
+	r.atrSLMult = strategy.GetFloatParam(config, "atr_sl_mult", 1.5)
+	r.atrTPMult = strategy.GetFloatParam(config, "atr_tp_mult", 3.0)
+	r.posUSDT = strategy.GetFloatParam(config, "position_usdt", 100)
+	r.leverage = strategy.GetIntParam(config, "leverage", 3)
 	r.candles = make([]exchange.Candle, 0)
 
 	log.Info().
@@ -138,6 +151,42 @@ func (r *RSIStrategy) OnCandle(candle exchange.Candle) {
 	currentRSI := r.rsiValues[len(r.rsiValues)-1]
 	prevRSI := r.rsiValues[len(r.rsiValues)-2]
 
+	// After calculating RSI, compute ATR if enabled
+	var sl, tp float64
+	var amount float64
+
+	if r.useATR && len(r.candles) >= r.atrPeriod+1 {
+		highs := make([]float64, len(r.candles))
+		lows := make([]float64, len(r.candles))
+		closes := make([]float64, len(r.candles))
+		for i, c := range r.candles {
+			highs[i] = c.High
+			lows[i] = c.Low
+			closes[i] = c.Close
+		}
+		atrValues := indicator.ATR(highs, lows, closes, r.atrPeriod)
+		if len(atrValues) > 0 {
+			atr := atrValues[len(atrValues)-1]
+			sl = atr * r.atrSLMult
+			tp = atr * r.atrTPMult
+
+			// Dynamic amount based on position USDT / price
+			if candle.Close > 0 {
+				amount = (r.posUSDT * float64(r.leverage)) / candle.Close
+			}
+		}
+	}
+
+	if sl == 0 {
+		sl = candle.Close * r.stopLoss // fallback to fixed %
+	}
+	if tp == 0 {
+		tp = candle.Close * r.takeProfit
+	}
+	if amount == 0 {
+		amount = r.amount // fallback to fixed
+	}
+
 	// Buy signal: RSI crosses above oversold from below
 	if r.position == nil && prevRSI < r.oversold && currentRSI >= r.oversold {
 		log.Info().
@@ -149,17 +198,17 @@ func (r *RSIStrategy) OnCandle(candle exchange.Candle) {
 			Action:     strategy.ActionBuy,
 			Pair:       r.pair,
 			Price:      candle.Close,
-			Amount:     r.amount,
+			Amount:     amount,
 			Type:       exchange.OrderMarket,
-			StopLoss:   candle.Close * (1 - r.stopLoss),
-			TakeProfit: candle.Close * (1 + r.takeProfit),
+			StopLoss:   candle.Close - sl,
+			TakeProfit: candle.Close + tp,
 			Reason:     fmt.Sprintf("RSI crossover buy: %.1f->%.1f", prevRSI, currentRSI),
 		})
 
 		r.position = &openPosition{
 			Side:       exchange.Buy,
 			EntryPrice: candle.Close,
-			Amount:     r.amount,
+			Amount:     amount,
 		}
 		return
 	}
@@ -175,17 +224,17 @@ func (r *RSIStrategy) OnCandle(candle exchange.Candle) {
 			Action:     strategy.ActionSell,
 			Pair:       r.pair,
 			Price:      candle.Close,
-			Amount:     r.amount,
+			Amount:     amount,
 			Type:       exchange.OrderMarket,
-			StopLoss:   candle.Close * (1 + r.stopLoss),
-			TakeProfit: candle.Close * (1 - r.takeProfit),
+			StopLoss:   candle.Close + sl,
+			TakeProfit: candle.Close - tp,
 			Reason:     fmt.Sprintf("RSI crossover short: %.1f->%.1f", prevRSI, currentRSI),
 		})
 
 		r.position = &openPosition{
 			Side:       exchange.Sell,
 			EntryPrice: candle.Close,
-			Amount:     r.amount,
+			Amount:     amount,
 		}
 		return
 	}

@@ -15,6 +15,19 @@ type Config struct {
 	Logging  LoggingConfig  `yaml:"logging"`
 	Database DatabaseConfig `yaml:"database"`
 	Paper    bool           `yaml:"paper"`
+	Risk     RiskConfig     `yaml:"risk"`
+}
+
+// RiskConfig holds risk management parameters for live trading.
+type RiskConfig struct {
+	MaxPositionUSDT  float64 `yaml:"max_position_usdt"` // max USDT per position
+	MaxDailyLoss     float64 `yaml:"max_daily_loss"`    // max daily loss USDT
+	MaxDrawdownPct   float64 `yaml:"max_drawdown_pct"`  // max drawdown %
+	MaxOpenPositions int     `yaml:"max_open_positions"`
+	DefaultLeverage  int     `yaml:"default_leverage"`
+	MinRiskReward    float64 `yaml:"min_risk_reward"`
+	MaxLossPerTrade  float64 `yaml:"max_loss_per_trade"` // hard cap per trade (e.g. 15)
+	DailyMaxTrades   int     `yaml:"daily_max_trades"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -69,6 +82,16 @@ func DefaultConfig() *Config {
 			Path: "mkk.db",
 		},
 		Paper: false,
+		Risk: RiskConfig{
+			MaxPositionUSDT:  100,
+			MaxDailyLoss:     30,
+			MaxDrawdownPct:   15,
+			MaxOpenPositions: 3,
+			DefaultLeverage:  3,
+			MinRiskReward:    2.0,
+			MaxLossPerTrade:  15,
+			DailyMaxTrades:   2,
+		},
 	}
 }
 

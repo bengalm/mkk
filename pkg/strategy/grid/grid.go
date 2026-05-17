@@ -596,6 +596,9 @@ func (g *GridStrategy) OnTick(ticker exchange.Ticker) {
 			_ = g.rebuildGrid("auto_shift")
 		}
 	}
+
+	// ── Breakout detection ──
+	g.handleBreakout(ticker.Last)
 }
 
 // OnCandle — trend check, volatility filter, ATR update.
@@ -648,6 +651,9 @@ func (g *GridStrategy) OnCandle(candle exchange.Candle) {
 		}
 
 		g.stopLossPrice = math.Round((g.lowPrice-g.currentATR*1.5)*100) / 100
+
+		// Dynamic spacing adjustment
+		g.adjustSpacing()
 	}
 }
 
@@ -718,6 +724,11 @@ func (g *GridStrategy) OnFill(trade exchange.Trade) {
 		Reason:    fmt.Sprintf("网格成交 %s %.4f @ %.2f | 累计利润: %.2f | 交易次数: %d", side, g.quantityPerGrid, filledPrice, g.profit, g.totalTrades),
 		Direction: string(g.effectiveDir),
 	})
+
+	// Persist state after each fill
+	if err := g.SaveState(); err != nil {
+		log.Debug().Err(err).Msg("Failed to save grid state after fill")
+	}
 }
 
 func (g *GridStrategy) findNextLevelUp(price float64) float64 {
@@ -950,10 +961,39 @@ func (g *GridStrategy) Stats() map[string]interface{} {
 	g.aiMu.RLock()
 	hasAI := g.lastAISignal != nil
 	aiDir := ""
+	aiConf := 0.0
 	if hasAI {
 		aiDir = g.lastAISignal.Direction
+		aiConf = g.lastAISignal.Confidence
 	}
 	g.aiMu.RUnlock()
+
+	// Performance metrics
+	runtime := time.Since(g.startTime)
+	var fillRate, pnlPerTrade, equityReturn float64
+	if g.totalTrades > 0 {
+		fillRate = float64(g.totalTrades) / runtime.Hours()
+		pnlPerTrade = g.profit / float64(g.totalTrades)
+	}
+	equity := g.getEquity()
+	if g.startEquity > 0 {
+		equityReturn = (equity - g.startEquity) / g.startEquity * 100
+	}
+
+	// Inventory
+	inventorySize := 0.0
+	inventoryPct := 0.0
+	positions, _ := g.Exchange().GetPositions(g.pair)
+	for _, p := range positions {
+		inventorySize += p.Size
+	}
+	if equity > 0 {
+		// inventoryPct = position notional / equity
+		// need current price for notional
+		if ticker, err := g.Exchange().GetTicker(g.pair); err == nil {
+			inventoryPct = (inventorySize * ticker.Last) / equity * 100
+		}
+	}
 
 	return map[string]interface{}{
 		"pair":            g.pair,
@@ -972,10 +1012,278 @@ func (g *GridStrategy) Stats() map[string]interface{} {
 		"rebuilds":        g.rebuildCount,
 		"paused":          g.paused,
 		"stopped":         g.stopped,
-		"runtime_hours":   time.Since(g.startTime).Hours(),
+		"runtime_hours":   math.Round(runtime.Hours()*10) / 10,
 		"ai_signal":       hasAI,
 		"ai_direction":    aiDir,
+		"ai_confidence":   math.Round(aiConf*100) / 100,
+		// Performance metrics
+		"equity":          math.Round(equity*100) / 100,
+		"equity_return":   math.Round(equityReturn*100) / 100,
+		"fill_rate_h":     math.Round(fillRate*100) / 100, // fills per hour
+		"pnl_per_trade":   math.Round(pnlPerTrade*100) / 100,
+		"inventory_size":  math.Round(inventorySize*1000) / 1000,
+		"inventory_pct":   math.Round(inventoryPct*10) / 10,
+		"start_equity":    math.Round(g.startEquity*100) / 100,
 	}
+}
+
+// ── Breakout Detection & Handling ──
+
+// handleBreakout detects price breaking out of grid range and responds.
+func (g *GridStrategy) handleBreakout(price float64) {
+	if g.highPrice == 0 || g.lowPrice == 0 || g.currentATR == 0 {
+		return
+	}
+
+	breakoutAbove := price > g.highPrice
+	breakoutBelow := price < g.lowPrice
+
+	if !breakoutAbove && !breakoutBelow {
+		return
+	}
+
+	// Calculate how far price is beyond grid range
+	var distancePct float64
+	if breakoutAbove {
+		distancePct = (price - g.highPrice) / g.highPrice * 100
+	} else {
+		distancePct = (g.lowPrice - price) / g.lowPrice * 100
+	}
+
+	// Only act if price is >1% beyond grid range
+	if distancePct < 1.0 {
+		return
+	}
+
+	// Get current position to assess inventory imbalance
+	positions, err := g.Exchange().GetPositions(g.pair)
+	if err != nil || len(positions) == 0 {
+		// No position — just widen grid
+		g.handleBreakoutWiden(price, breakoutAbove)
+		return
+	}
+
+	posSize := 0.0
+	for _, p := range positions {
+		posSize += p.Size
+	}
+
+	// If position is small relative to equity, widen grid
+	equity := g.getEquity()
+	if equity == 0 {
+		return
+	}
+	positionPct := (posSize * price) / equity
+
+	if positionPct < 0.30 {
+		// Low inventory — widen grid
+		g.handleBreakoutWiden(price, breakoutAbove)
+	} else if positionPct < 0.60 {
+		// Medium inventory — widen + hedge partial
+		g.handleBreakoutHedge(price, breakoutAbove, positions)
+	} else {
+		// Heavy inventory — emergency close
+		direction := "上方"
+		if breakoutBelow {
+			direction = "下方"
+		}
+		g.emergencyClose(fmt.Sprintf("突破%s %.1f%%, 仓位过重 %.0f%%", direction, distancePct, positionPct*100))
+	}
+}
+
+// handleBreakoutWiden rebuilds grid centered on current price with wider range.
+func (g *GridStrategy) handleBreakoutWiden(price float64, above bool) {
+	// Expand grid range by 50%
+	rangeSize := g.highPrice - g.lowPrice
+	expandBy := rangeSize * 0.25 // expand each side by 25%
+
+	if above {
+		g.highPrice += expandBy
+		g.lowPrice += expandBy * 0.5 // slight upward shift
+	} else {
+		g.lowPrice -= expandBy
+		g.highPrice -= expandBy * 0.5 // slight downward shift
+	}
+
+	// Rebuild grid with new bounds
+	g.notify("breakout_widen", GridNotification{
+		Type:   "breakout_widen",
+		Pair:   g.pair,
+		Price:  price,
+		Reason: fmt.Sprintf("突破! 价格%.2f超出网格, 扩大范围至 %.2f-%.2f", price, g.lowPrice, g.highPrice),
+	})
+	_ = g.rebuildGrid("breakout_widen")
+}
+
+// handleBreakoutHedge widens grid and partially hedges position.
+func (g *GridStrategy) handleBreakoutHedge(price float64, above bool, positions []exchange.Position) {
+	// First widen
+	g.handleBreakoutWiden(price, above)
+
+	// Then hedge 30% of position
+	for _, pos := range positions {
+		if pos.Size == 0 {
+			continue
+		}
+		hedgeQty := pos.Size * 0.3
+		hedgeSide := exchange.Sell
+		if pos.Side == "short" {
+			hedgeSide = exchange.Buy
+		}
+		_, err := g.Exchange().PlaceOrder(exchange.OrderRequest{
+			Pair:       g.pair,
+			Side:       hedgeSide,
+			Type:       exchange.OrderMarket,
+			Amount:     hedgeQty,
+			ReduceOnly: true,
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("Breakout hedge order failed")
+		} else {
+			g.notify("breakout_hedge", GridNotification{
+				Type:   "breakout_hedge",
+				Pair:   g.pair,
+				Price:  price,
+				Reason: fmt.Sprintf("突破对冲: %s %.4f @ %.2f", hedgeSide, hedgeQty, price),
+			})
+		}
+	}
+}
+
+// ── Dynamic Spacing ──
+
+// adjustSpacing dynamically adjusts grid spacing based on ATR volatility.
+func (g *GridStrategy) adjustSpacing() {
+	if g.currentATR == 0 || g.avgATR == 0 {
+		return
+	}
+
+	// Volatility ratio: current ATR vs average ATR
+	volRatio := g.currentATR / g.avgATR
+
+	// Base spacing from config
+	baseSpacing := g.spacingPct
+	newSpacing := baseSpacing
+
+	if volRatio > 1.5 {
+		// High volatility: widen spacing (less levels, bigger profit per fill)
+		newSpacing = baseSpacing * (1 + (volRatio-1.5)*0.3)
+		if newSpacing > baseSpacing*2.0 {
+			newSpacing = baseSpacing * 2.0
+		}
+	} else if volRatio < 0.6 {
+		// Low volatility: tighten spacing (more levels, smaller profit but more fills)
+		newSpacing = baseSpacing * (0.7 + volRatio*0.3)
+	}
+
+	newSpacing = math.Round(newSpacing*100) / 100
+	if newSpacing != g.spacingPct && newSpacing >= 0.5 {
+		log.Info().
+			Float64("old_spacing", g.spacingPct).
+			Float64("new_spacing", newSpacing).
+			Float64("vol_ratio", volRatio).
+			Msg("Dynamic spacing adjusted")
+
+		g.spacingPct = newSpacing
+		_ = g.rebuildGrid("dynamic_spacing")
+	}
+}
+
+// ── State Persistence ──
+
+// SaveState persists current grid state to a JSON file for crash recovery.
+func (g *GridStrategy) SaveState() error {
+	type GridState struct {
+		Pair          string             `json:"pair"`
+		HighPrice     float64            `json:"high_price"`
+		LowPrice      float64            `json:"low_price"`
+		SpacingPct    float64            `json:"spacing_pct"`
+		EffectiveDir  string             `json:"effective_dir"`
+		Orders        map[float64]string `json:"orders"`
+		ActiveOrders  map[string]bool    `json:"active_orders"`
+		Profit        float64            `json:"profit"`
+		TotalTrades   int                `json:"total_trades"`
+		StopLossPrice float64            `json:"stop_loss_price"`
+		CurrentATR    float64            `json:"current_atr"`
+		StartEquity   float64            `json:"start_equity"`
+		StartTime     time.Time          `json:"start_time"`
+		RebuildCount  int                `json:"rebuild_count"`
+	}
+
+	state := GridState{
+		Pair:          g.pair,
+		HighPrice:     g.highPrice,
+		LowPrice:      g.lowPrice,
+		SpacingPct:    g.spacingPct,
+		EffectiveDir:  string(g.effectiveDir),
+		Orders:        g.orders,
+		ActiveOrders:  g.activeOrders,
+		Profit:        g.profit,
+		TotalTrades:   g.totalTrades,
+		StopLossPrice: g.stopLossPrice,
+		CurrentATR:    g.currentATR,
+		StartEquity:   g.startEquity,
+		StartTime:     g.startTime,
+		RebuildCount:  g.rebuildCount,
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile("grid_state.json", data, 0644)
+}
+
+// LoadState restores grid state from saved JSON file.
+func (g *GridStrategy) LoadState() error {
+	data, err := os.ReadFile("grid_state.json")
+	if err != nil {
+		return err
+	}
+
+	var state struct {
+		Pair          string             `json:"pair"`
+		HighPrice     float64            `json:"high_price"`
+		LowPrice      float64            `json:"low_price"`
+		SpacingPct    float64            `json:"spacing_pct"`
+		EffectiveDir  string             `json:"effective_dir"`
+		Orders        map[float64]string `json:"orders"`
+		ActiveOrders  map[string]bool    `json:"active_orders"`
+		Profit        float64            `json:"profit"`
+		TotalTrades   int                `json:"total_trades"`
+		StopLossPrice float64            `json:"stop_loss_price"`
+		CurrentATR    float64            `json:"current_atr"`
+		StartEquity   float64            `json:"start_equity"`
+		StartTime     time.Time          `json:"start_time"`
+		RebuildCount  int                `json:"rebuild_count"`
+	}
+
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+
+	g.pair = state.Pair
+	g.highPrice = state.HighPrice
+	g.lowPrice = state.LowPrice
+	g.spacingPct = state.SpacingPct
+	g.effectiveDir = Direction(state.EffectiveDir)
+	g.orders = state.Orders
+	g.activeOrders = state.ActiveOrders
+	g.profit = state.Profit
+	g.totalTrades = state.TotalTrades
+	g.stopLossPrice = state.StopLossPrice
+	g.currentATR = state.CurrentATR
+	g.startEquity = state.StartEquity
+	g.startTime = state.StartTime
+	g.rebuildCount = state.RebuildCount
+
+	log.Info().
+		Str("pair", g.pair).
+		Float64("profit", g.profit).
+		Int("trades", g.totalTrades).
+		Msg("Grid state restored from file")
+
+	return nil
 }
 
 // ── Helpers ──

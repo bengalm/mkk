@@ -39,11 +39,15 @@ type OKXExchange struct {
 	wsConn      *websocket.Conn        // public WS
 	wsPrivConn  *websocket.Conn        // private WS
 	wsMu        sync.Mutex
-	wsPrivMu    sync.Mutex
-	simulated   string                 // "1" for demo trading
-	handlers    map[string]func(json.RawMessage) // public WS channel→handler
-	orderHandler func(exchange.Trade)  // private WS order fill handler
-	wsDone      chan struct{}          // signal to stop WS read loops
+	wsPrivMu      sync.Mutex
+	simulated     string                 // "1" for demo trading
+	handlers      map[string]func(json.RawMessage) // public WS channel→handler
+	orderHandlers []func(exchange.Trade)            // private WS order fill handlers
+	orderMu       sync.Mutex                         // protects orderHandlers
+	wsDone        chan struct{}                       // signal to stop WS read loops
+	// Fill reconciliation
+	reconcileMu     sync.Mutex
+	lastReconcileTS int64 // unix seconds of last successful reconciliation
 }
 
 // New creates a new OKX exchange client.
@@ -62,8 +66,8 @@ func New(cfg Config) (*OKXExchange, error) {
 			}
 			return "0"
 		}(),
-		handlers: make(map[string]func(json.RawMessage)),
-		wsDone:   make(chan struct{}),
+		handlers:    make(map[string]func(json.RawMessage)),
+		wsDone:      make(chan struct{}),
 	}, nil
 }
 
@@ -762,18 +766,25 @@ func (o *OKXExchange) reconnectPublicWS() {
 }
 
 // SubscribeOrders subscribes to private order updates via OKX private WebSocket.
-// It handles authentication, heartbeat, and reconnection automatically.
+// SubscribeOrders subscribes to OKX private WS for order fill events.
 func (o *OKXExchange) SubscribeOrders(handler func(exchange.Trade)) error {
+	o.orderMu.Lock()
+	o.orderHandlers = append(o.orderHandlers, handler)
+	o.orderMu.Unlock()
+
+	// If private WS already connected, just add handler
 	o.wsPrivMu.Lock()
-	defer o.wsPrivMu.Unlock()
+	if o.wsPrivConn != nil {
+		o.wsPrivMu.Unlock()
+		return nil
+	}
+	o.wsPrivMu.Unlock()
 
-	o.orderHandler = handler
-
+	// Dial private WS
 	conn, _, err := websocket.DefaultDialer.Dial(wsURLPrivate, nil)
 	if err != nil {
-		return fmt.Errorf("connect to OKX private WS: %w", err)
+		return fmt.Errorf("private WS dial: %w", err)
 	}
-	o.wsPrivConn = conn
 
 	// Login
 	ts := WSTimestamp()
@@ -789,13 +800,16 @@ func (o *OKXExchange) SubscribeOrders(handler func(exchange.Trade)) error {
 			},
 		},
 	}
-	if err := o.wsPrivConn.WriteJSON(loginMsg); err != nil {
+	if err := conn.WriteJSON(loginMsg); err != nil {
+		conn.Close()
 		return fmt.Errorf("WS login write: %w", err)
 	}
 
 	// Wait for login response
-	_, msg, err := o.wsPrivConn.ReadMessage()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, msg, err := conn.ReadMessage()
 	if err != nil {
+		conn.Close()
 		return fmt.Errorf("WS login read: %w", err)
 	}
 	var loginResp struct {
@@ -804,43 +818,78 @@ func (o *OKXExchange) SubscribeOrders(handler func(exchange.Trade)) error {
 	}
 	json.Unmarshal(msg, &loginResp)
 	if loginResp.Event == "error" {
+		conn.Close()
 		return fmt.Errorf("WS login failed: %s", loginResp.Msg)
 	}
 	log.Info().Msg("OKX private WS authenticated")
 
-	// Subscribe to orders channel
+	// Subscribe to orders + account channels
 	subMsg := map[string]interface{}{
 		"op": "subscribe",
 		"args": []map[string]string{
 			{"channel": "orders", "instType": "SWAP"},
+			{"channel": "account"},
 		},
 	}
-	if err := o.wsPrivConn.WriteJSON(subMsg); err != nil {
+	if err := conn.WriteJSON(subMsg); err != nil {
+		conn.Close()
 		return fmt.Errorf("WS subscribe orders: %w", err)
 	}
 
-	// Read loop
+	o.wsPrivMu.Lock()
+	o.wsPrivConn = conn
+	o.wsPrivMu.Unlock()
+
+	// Read loop in goroutine
 	go o.privateWSReadLoop()
+
+	// Fill reconciliation loop
+	go o.reconciliationLoop()
 
 	log.Info().Msg("Subscribed to OKX order updates via private WS")
 	return nil
 }
 
-// privateWSReadLoop reads from private WS with ping/pong + reconnection.
+// dispatchFill sends a fill trade to all registered handlers.
+func (o *OKXExchange) dispatchFill(trade exchange.Trade) {
+	o.orderMu.Lock()
+	handlers := make([]func(exchange.Trade), len(o.orderHandlers))
+	copy(handlers, o.orderHandlers)
+	o.orderMu.Unlock()
+
+	for _, h := range handlers {
+		h(trade)
+	}
+}
+
+// privateWSReadLoop reads from private WS with proper blocking + ping.
 func (o *OKXExchange) privateWSReadLoop() {
-	pingTicker := time.NewTicker(25 * time.Second)
-	defer pingTicker.Stop()
+	// Ping goroutine — sends keepalive every 25s
+	pingDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				o.wsPrivMu.Lock()
+				if o.wsPrivConn != nil {
+					o.wsPrivConn.WriteMessage(websocket.TextMessage, []byte("ping"))
+				}
+				o.wsPrivMu.Unlock()
+			case <-pingDone:
+				return
+			case <-o.wsDone:
+				return
+			}
+		}
+	}()
+	defer close(pingDone)
 
 	for {
 		select {
 		case <-o.wsDone:
 			return
-		case <-pingTicker.C:
-			o.wsPrivMu.Lock()
-			if o.wsPrivConn != nil {
-				o.wsPrivConn.WriteMessage(websocket.TextMessage, []byte("ping"))
-			}
-			o.wsPrivMu.Unlock()
 		default:
 		}
 
@@ -852,11 +901,14 @@ func (o *OKXExchange) privateWSReadLoop() {
 			continue
 		}
 
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		// Blocking read with 60s deadline (must be > ping interval of 25s)
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Warn().Err(err).Msg("OKX private WS disconnected, reconnecting...")
-			o.reconnectPrivateWS()
+			if !isShutdown(o.wsDone) {
+				log.Warn().Err(err).Msg("OKX private WS read error, reconnecting...")
+				o.reconnectPrivateWS()
+			}
 			continue
 		}
 
@@ -865,71 +917,185 @@ func (o *OKXExchange) privateWSReadLoop() {
 			continue
 		}
 
-		// Parse order update
-		var wsMsg struct {
-			Arg  struct {
-				Channel string `json:"channel"`
-			} `json:"arg"`
-			Data json.RawMessage `json:"data"`
-		}
-		if err := json.Unmarshal(msg, &wsMsg); err != nil {
+		o.handlePrivateWSMessage(msg)
+	}
+}
+
+// handlePrivateWSMessage parses and dispatches private WS messages.
+func (o *OKXExchange) handlePrivateWSMessage(msg []byte) {
+	var wsMsg struct {
+		Arg  struct {
+			Channel string `json:"channel"`
+		} `json:"arg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(msg, &wsMsg); err != nil {
+		return
+	}
+
+	switch wsMsg.Arg.Channel {
+	case "orders":
+		o.handleOrderUpdate(wsMsg.Data)
+	case "account":
+		// Account updates — could track balance changes
+		log.Debug().RawJSON("data", wsMsg.Data).Msg("Account update received")
+	}
+}
+
+// handleOrderUpdate parses order fill events and dispatches to handlers.
+func (o *OKXExchange) handleOrderUpdate(data json.RawMessage) {
+	var orders []struct {
+		OrdID   string `json:"ordId"`
+		InstID  string `json:"instId"`
+		ClOrdID string `json:"clOrdId"`
+		Side    string `json:"side"`
+		OrdType string `json:"ordType"`
+		Px      string `json:"px"`
+		Sz      string `json:"sz"`
+		FillSz  string `json:"fillSz"`
+		FillPx  string `json:"avgPx"`
+		State   string `json:"state"`
+		TS      string `json:"uTime"`
+	}
+	if err := json.Unmarshal(data, &orders); err != nil {
+		return
+	}
+
+	for _, ord := range orders {
+		if ord.State != "filled" {
 			continue
 		}
-		if wsMsg.Arg.Channel != "orders" || wsMsg.Data == nil {
+		fillSz := parseFloat(ord.FillSz)
+		if fillSz == 0 {
 			continue
 		}
 
-		// Parse order data array
-		var orders []struct {
-			OrdID   string `json:"ordId"`
-			InstID  string `json:"instId"`
-			ClOrdID string `json:"clOrdId"`
-			Side    string `json:"side"`
-			OrdType string `json:"ordType"`
-			Px      string `json:"px"`
-			Sz      string `json:"sz"`
-			FillSz  string `json:"fillSz"`
-			FillPx  string `json:"avgPx"` // use avgPx for fill price
-			State   string `json:"state"`
-			TS      string `json:"uTime"`
-		}
-		if err := json.Unmarshal(wsMsg.Data, &orders); err != nil {
-			continue
+		ts, _ := strconv.ParseInt(ord.TS, 10, 64)
+		trade := exchange.Trade{
+			ID:        ord.OrdID,
+			OrderID:   ord.OrdID,
+			Pair:      convertInstID(ord.InstID),
+			Side:      exchange.OrderSide(ord.Side),
+			Price:     parseFloat(ord.FillPx),
+			Amount:    fillSz,
+			Timestamp: time.UnixMilli(ts),
 		}
 
-		for _, ord := range orders {
-			// Only handle fully filled orders
-			if ord.State != "filled" {
-				continue
-			}
-			fillSz := parseFloat(ord.FillSz)
-			if fillSz == 0 {
-				continue
-			}
+		log.Info().
+			Str("order_id", ord.OrdID).
+			Str("side", ord.Side).
+			Float64("price", trade.Price).
+			Float64("amount", trade.Amount).
+			Msg("Order filled via WS")
 
-			ts, _ := strconv.ParseInt(ord.TS, 10, 64)
-			trade := exchange.Trade{
-				ID:        ord.OrdID,
-				OrderID:   ord.OrdID,
-				Pair:      convertInstID(ord.InstID),
-				Side:      exchange.OrderSide(ord.Side),
-				Price:     parseFloat(ord.FillPx),
-				Amount:    fillSz,
-				Timestamp: time.UnixMilli(ts),
-			}
+		o.dispatchFill(trade)
+	}
+}
 
-			log.Info().
-				Str("order_id", ord.OrdID).
-				Str("side", ord.Side).
-				Float64("price", trade.Price).
-				Float64("amount", trade.Amount).
-				Msg("Order filled via WS")
+// isShutdown checks if the done channel is closed.
+func isShutdown(done chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
 
-			if o.orderHandler != nil {
-				o.orderHandler(trade)
-			}
+// reconciliationLoop periodically checks for missed fills via REST.
+func (o *OKXExchange) reconciliationLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-o.wsDone:
+			return
+		case <-ticker.C:
+			o.reconcileFills()
 		}
 	}
+}
+
+// reconcileFills queries recent closed orders via REST API and checks for fills we missed.
+func (o *OKXExchange) reconcileFills() {
+	o.reconcileMu.Lock()
+	lastTS := o.lastReconcileTS
+	o.reconcileMu.Unlock()
+
+	now := time.Now().Unix()
+	if lastTS == 0 {
+		// First run — just record the timestamp
+		o.reconcileMu.Lock()
+		o.lastReconcileTS = now
+		o.reconcileMu.Unlock()
+		return
+	}
+
+	// Query OKX closed orders via REST
+	since := strconv.FormatInt((lastTS-60)*1000, 10) // ms, 60s overlap
+	nowMS := strconv.FormatInt(now*1000, 10)
+	endpoint := fmt.Sprintf("/api/v5/trade/orders-history-archive?instType=SWAP&after=%s&before=%s&limit=20", since, nowMS)
+	data, err := o.request("GET", endpoint, nil)
+	if err != nil {
+		log.Debug().Err(err).Msg("Fill reconciliation: REST query failed")
+		o.reconcileMu.Lock()
+		o.lastReconcileTS = now
+		o.reconcileMu.Unlock()
+		return
+	}
+
+	var resp struct {
+		Code string `json:"code"`
+		Data []struct {
+			OrdID  string `json:"ordId"`
+			InstID string `json:"instId"`
+			Side   string `json:"side"`
+			Sz     string `json:"sz"`
+			State  string `json:"state"`
+			AvgPx  string `json:"avgPx"`
+			UTime  string `json:"uTime"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		log.Debug().Err(err).Msg("Fill reconciliation: parse failed")
+		o.reconcileMu.Lock()
+		o.lastReconcileTS = now
+		o.reconcileMu.Unlock()
+		return
+	}
+
+	for _, ord := range resp.Data {
+		if ord.State != "filled" {
+			continue
+		}
+		fillSz := parseFloat(ord.Sz)
+		if fillSz == 0 {
+			continue
+		}
+
+		ts, _ := strconv.ParseInt(ord.UTime, 10, 64)
+		trade := exchange.Trade{
+			ID:        ord.OrdID,
+			OrderID:   ord.OrdID,
+			Pair:      convertInstID(ord.InstID),
+			Side:      exchange.OrderSide(ord.Side),
+			Price:     parseFloat(ord.AvgPx),
+			Amount:    fillSz,
+			Timestamp: time.UnixMilli(ts),
+		}
+
+		log.Info().
+			Str("order_id", ord.OrdID).
+			Str("side", ord.Side).
+			Msg("Reconciliation: detected filled order")
+
+		o.dispatchFill(trade)
+	}
+
+	o.reconcileMu.Lock()
+	o.lastReconcileTS = now
+	o.reconcileMu.Unlock()
 }
 
 // reconnectPrivateWS reconnects and re-authenticates the private WebSocket.

@@ -91,9 +91,10 @@ type GridStrategy struct {
 	lastTrendChk time.Time
 
 	// AI signal file
-	aiSignalPath string
-	lastAISignal *AISignal
-	aiMu         sync.RWMutex
+	aiSignalPath   string
+	lastAISignal   *AISignal
+	aiMu           sync.RWMutex
+	lastAIFileCheck time.Time
 
 	// ATR
 	atrPeriod  int
@@ -269,6 +270,14 @@ func (g *GridStrategy) loadAISignal() error {
 		return err
 	}
 
+	// ── Skip if timestamp unchanged (same signal, no reload) ──
+	if g.lastAISignal != nil && g.lastAISignal.Timestamp == sig.Timestamp {
+		log.Debug().
+			Str("timestamp", sig.Timestamp).
+			Msg("AI signal timestamp unchanged, skipping")
+		return nil
+	}
+
 	// Validate timestamp (must be within 12 hours)
 	ts, err := time.Parse(time.RFC3339, sig.Timestamp)
 	if err == nil && time.Since(ts) > 12*time.Hour {
@@ -276,6 +285,10 @@ func (g *GridStrategy) loadAISignal() error {
 	}
 
 	prevDir := g.effectiveDir
+	prevSignalTS := ""
+	if g.lastAISignal != nil {
+		prevSignalTS = g.lastAISignal.Timestamp
+	}
 	g.lastAISignal = &sig
 
 	// Apply AI direction if confidence >= 0.6
@@ -302,7 +315,20 @@ func (g *GridStrategy) loadAISignal() error {
 		Float64("confidence", sig.Confidence).
 		Str("reason", sig.Reason).
 		Str("effective_dir", string(g.effectiveDir)).
+		Str("prev_ts", prevSignalTS).
+		Str("new_ts", sig.Timestamp).
 		Msg("AI signal loaded")
+
+	// Update stop-loss from AI signal if provided
+	if sig.StopHint > 0 {
+		if g.effectiveDir == DirShort && sig.StopHint > g.stopLossPrice {
+			g.stopLossPrice = sig.StopHint
+			log.Info().Float64("stop_loss", g.stopLossPrice).Msg("Stop-loss updated from AI signal")
+		} else if g.effectiveDir == DirLong && (sig.StopHint < g.stopLossPrice || g.stopLossPrice == 0) {
+			g.stopLossPrice = sig.StopHint
+			log.Info().Float64("stop_loss", g.stopLossPrice).Msg("Stop-loss updated from AI signal")
+		}
+	}
 
 	// Rebuild grid if direction changed
 	if prevDir != "" && prevDir != g.effectiveDir {
@@ -536,16 +562,31 @@ func (g *GridStrategy) OnTick(ticker exchange.Ticker) {
 	}
 
 	// ── AI signal reload check (every 5 min) ──
-	if g.autoTrend && g.lastAISignal != nil {
-		g.aiMu.RLock()
-		lastTS, _ := time.Parse(time.RFC3339, g.lastAISignal.Timestamp)
-		g.aiMu.RUnlock()
-		if time.Since(lastTS) > 5*time.Minute {
-			// Check file mod time
-			if info, err := os.Stat(g.aiSignalPath); err == nil {
-				if info.ModTime().After(lastTS) {
-					if err := g.loadAISignal(); err != nil {
-						log.Debug().Err(err).Msg("AI signal reload failed")
+	if g.autoTrend {
+		if time.Since(g.lastAIFileCheck) > 5*time.Minute {
+			g.lastAIFileCheck = time.Now()
+
+			// Quick read: only parse timestamp field to decide if reload needed
+			raw, err := os.ReadFile(g.aiSignalPath)
+			if err != nil {
+				log.Debug().Err(err).Msg("AI signal file read failed")
+			} else {
+				var peek struct {
+					Timestamp string `json:"timestamp"`
+				}
+				if json.Unmarshal(raw, &peek) == nil {
+					g.aiMu.RLock()
+					lastTS := ""
+					if g.lastAISignal != nil {
+						lastTS = g.lastAISignal.Timestamp
+					}
+					g.aiMu.RUnlock()
+
+					// Only full-load if timestamp differs
+					if peek.Timestamp != lastTS {
+						if err := g.loadAISignal(); err != nil {
+							log.Debug().Err(err).Msg("AI signal reload failed")
+						}
 					}
 				}
 			}

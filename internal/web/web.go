@@ -8,6 +8,7 @@ import (
 
 	"github.com/bengalm/mkk/pkg/paper"
 	"github.com/bengalm/mkk/pkg/repository"
+	"github.com/bengalm/mkk/pkg/strategy"
 	"github.com/bengalm/mkk/pkg/trader"
 	"github.com/rs/zerolog/log"
 )
@@ -18,8 +19,12 @@ type Server struct {
 	repo     *repository.Repository
 	trader   *trader.Engine
 	paper    *paper.PaperEngine
+	strategy strategy.Strategy
 	mux      *http.ServeMux
 }
+
+// SetStrategy sets the active strategy for stats endpoint.
+func (s *Server) SetStrategy(st strategy.Strategy) { s.strategy = st }
 
 // NewServer creates a new web server.
 func NewServer(port int, repo *repository.Repository) *Server {
@@ -54,6 +59,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/balance", s.handleBalance)
 	s.mux.HandleFunc("/api/strategies", s.handleStrategies)
 	s.mux.HandleFunc("/api/candles", s.handleCandles)
+	s.mux.HandleFunc("/api/strategy/stats", s.handleStrategyStats)
 
 	// Dashboard
 	s.mux.HandleFunc("/", s.handleDashboard)
@@ -125,6 +131,14 @@ func (s *Server) handleStrategies(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, map[string]interface{}{
 		"strategies": []string{"grid", "dca", "rsi"},
 	})
+}
+
+func (s *Server) handleStrategyStats(w http.ResponseWriter, r *http.Request) {
+	if s.strategy == nil {
+		s.errorResponse(w, http.StatusNotFound, "no active strategy")
+		return
+	}
+	s.jsonResponse(w, s.strategy.Stats())
 }
 
 func (s *Server) handleCandles(w http.ResponseWriter, r *http.Request) {

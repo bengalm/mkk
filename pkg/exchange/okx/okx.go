@@ -34,11 +34,16 @@ type Config struct {
 
 // OKXExchange implements exchange.Exchange for OKX.
 type OKXExchange struct {
-	config     Config
-	httpClient *http.Client
-	wsConn     *websocket.Conn
-	wsMu       sync.Mutex
-	simulated  string // "1" for demo trading
+	config      Config
+	httpClient  *http.Client
+	wsConn      *websocket.Conn        // public WS
+	wsPrivConn  *websocket.Conn        // private WS
+	wsMu        sync.Mutex
+	wsPrivMu    sync.Mutex
+	simulated   string                 // "1" for demo trading
+	handlers    map[string]func(json.RawMessage) // public WS channel→handler
+	orderHandler func(exchange.Trade)  // private WS order fill handler
+	wsDone      chan struct{}          // signal to stop WS read loops
 }
 
 // New creates a new OKX exchange client.
@@ -47,7 +52,7 @@ func New(cfg Config) (*OKXExchange, error) {
 		return nil, fmt.Errorf("validate OKX credentials: %w", err)
 	}
 	return &OKXExchange{
-		config: cfg,
+		config:     cfg,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -57,6 +62,8 @@ func New(cfg Config) (*OKXExchange, error) {
 			}
 			return "0"
 		}(),
+		handlers: make(map[string]func(json.RawMessage)),
+		wsDone:   make(chan struct{}),
 	}, nil
 }
 
@@ -643,43 +650,27 @@ func (o *OKXExchange) SubscribeOrderBook(pair string, handler func(exchange.Orde
 }
 
 // subscribePublic connects to OKX public WebSocket and subscribes to a channel.
+// Supports multiple handlers per channel with automatic reconnection.
 func (o *OKXExchange) subscribePublic(channel, instID string, handler func(json.RawMessage)) error {
 	o.wsMu.Lock()
 	defer o.wsMu.Unlock()
 
+	// Store handler by channel+instID key
+	handlerKey := channel + ":" + instID
+	o.handlers[handlerKey] = handler
+
 	if o.wsConn == nil {
 		conn, _, err := websocket.DefaultDialer.Dial(wsURLLive, nil)
 		if err != nil {
-			return fmt.Errorf("connect to OKX WS: %w", err)
+			return fmt.Errorf("connect to OKX public WS: %w", err)
 		}
 		o.wsConn = conn
 
-		// Read loop
-		go func() {
-			defer o.wsConn.Close()
-			for {
-				_, msg, err := o.wsConn.ReadMessage()
-				if err != nil {
-					log.Error().Err(err).Msg("OKX WS read error")
-					return
-				}
-				var wsMsg struct {
-					Arg struct {
-						Channel string `json:"channel"`
-						InstID  string `json:"instId"`
-					} `json:"arg"`
-					Data json.RawMessage `json:"data"`
-				}
-				if err := json.Unmarshal(msg, &wsMsg); err != nil {
-					continue
-				}
-				if wsMsg.Data != nil {
-					handler(wsMsg.Data)
-				}
-			}
-		}()
+		// Read loop with reconnection
+		go o.publicWSReadLoop()
 	}
 
+	// Subscribe
 	sub := map[string]interface{}{
 		"op": "subscribe",
 		"args": []map[string]string{
@@ -689,10 +680,328 @@ func (o *OKXExchange) subscribePublic(channel, instID string, handler func(json.
 	return o.wsConn.WriteJSON(sub)
 }
 
+// publicWSReadLoop reads messages from public WS and dispatches to handlers.
+func (o *OKXExchange) publicWSReadLoop() {
+	for {
+		select {
+		case <-o.wsDone:
+			return
+		default:
+		}
+
+		_, msg, err := o.wsConn.ReadMessage()
+		if err != nil {
+			log.Warn().Err(err).Msg("OKX public WS disconnected, reconnecting...")
+			o.reconnectPublicWS()
+			continue
+		}
+
+		// Handle ping/pong
+		if string(msg) == "pong" {
+			continue
+		}
+
+		var wsMsg struct {
+			Arg  struct {
+				Channel string `json:"channel"`
+				InstID  string `json:"instId"`
+			} `json:"arg"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(msg, &wsMsg); err != nil {
+			continue
+		}
+		if wsMsg.Data == nil {
+			continue
+		}
+
+		handlerKey := wsMsg.Arg.Channel + ":" + wsMsg.Arg.InstID
+		o.wsMu.Lock()
+		h, ok := o.handlers[handlerKey]
+		o.wsMu.Unlock()
+		if ok {
+			h(wsMsg.Data)
+		}
+	}
+}
+
+// reconnectPublicWS reconnects the public WebSocket and re-subscribes all channels.
+func (o *OKXExchange) reconnectPublicWS() {
+	o.wsMu.Lock()
+	defer o.wsMu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURLLive, nil)
+		if err != nil {
+			log.Error().Err(err).Int("attempt", i+1).Msg("Public WS reconnect failed")
+			time.Sleep(time.Duration(i+1) * 2 * time.Second)
+			continue
+		}
+		o.wsConn = conn
+
+		// Re-subscribe all stored handlers
+		for key, _ := range o.handlers {
+			parts := strings.SplitN(key, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			sub := map[string]interface{}{
+				"op": "subscribe",
+				"args": []map[string]string{
+					{"channel": parts[0], "instId": parts[1]},
+				},
+			}
+			if err := o.wsConn.WriteJSON(sub); err != nil {
+				log.Error().Err(err).Str("key", key).Msg("Re-subscribe failed")
+			}
+		}
+		log.Info().Int("handlers", len(o.handlers)).Msg("Public WS reconnected")
+		return
+	}
+	log.Error().Msg("Public WS reconnect exhausted all retries")
+}
+
+// SubscribeOrders subscribes to private order updates via OKX private WebSocket.
+// It handles authentication, heartbeat, and reconnection automatically.
+func (o *OKXExchange) SubscribeOrders(handler func(exchange.Trade)) error {
+	o.wsPrivMu.Lock()
+	defer o.wsPrivMu.Unlock()
+
+	o.orderHandler = handler
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURLPrivate, nil)
+	if err != nil {
+		return fmt.Errorf("connect to OKX private WS: %w", err)
+	}
+	o.wsPrivConn = conn
+
+	// Login
+	ts := WSTimestamp()
+	sign := Sign(ts, "GET", "/users/self/verify", "", o.config.SecretKey)
+	loginMsg := map[string]interface{}{
+		"op": "login",
+		"args": []map[string]string{
+			{
+				"apiKey":     o.config.APIKey,
+				"passphrase": o.config.Passphrase,
+				"timestamp":  ts,
+				"sign":       sign,
+			},
+		},
+	}
+	if err := o.wsPrivConn.WriteJSON(loginMsg); err != nil {
+		return fmt.Errorf("WS login write: %w", err)
+	}
+
+	// Wait for login response
+	_, msg, err := o.wsPrivConn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("WS login read: %w", err)
+	}
+	var loginResp struct {
+		Event string `json:"event"`
+		Msg   string `json:"msg"`
+	}
+	json.Unmarshal(msg, &loginResp)
+	if loginResp.Event == "error" {
+		return fmt.Errorf("WS login failed: %s", loginResp.Msg)
+	}
+	log.Info().Msg("OKX private WS authenticated")
+
+	// Subscribe to orders channel
+	subMsg := map[string]interface{}{
+		"op": "subscribe",
+		"args": []map[string]string{
+			{"channel": "orders", "instType": "SWAP"},
+		},
+	}
+	if err := o.wsPrivConn.WriteJSON(subMsg); err != nil {
+		return fmt.Errorf("WS subscribe orders: %w", err)
+	}
+
+	// Read loop
+	go o.privateWSReadLoop()
+
+	log.Info().Msg("Subscribed to OKX order updates via private WS")
+	return nil
+}
+
+// privateWSReadLoop reads from private WS with ping/pong + reconnection.
+func (o *OKXExchange) privateWSReadLoop() {
+	pingTicker := time.NewTicker(25 * time.Second)
+	defer pingTicker.Stop()
+
+	for {
+		select {
+		case <-o.wsDone:
+			return
+		case <-pingTicker.C:
+			o.wsPrivMu.Lock()
+			if o.wsPrivConn != nil {
+				o.wsPrivConn.WriteMessage(websocket.TextMessage, []byte("ping"))
+			}
+			o.wsPrivMu.Unlock()
+		default:
+		}
+
+		o.wsPrivMu.Lock()
+		conn := o.wsPrivConn
+		o.wsPrivMu.Unlock()
+		if conn == nil {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Warn().Err(err).Msg("OKX private WS disconnected, reconnecting...")
+			o.reconnectPrivateWS()
+			continue
+		}
+
+		msgStr := string(msg)
+		if msgStr == "pong" {
+			continue
+		}
+
+		// Parse order update
+		var wsMsg struct {
+			Arg  struct {
+				Channel string `json:"channel"`
+			} `json:"arg"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(msg, &wsMsg); err != nil {
+			continue
+		}
+		if wsMsg.Arg.Channel != "orders" || wsMsg.Data == nil {
+			continue
+		}
+
+		// Parse order data array
+		var orders []struct {
+			OrdID   string `json:"ordId"`
+			InstID  string `json:"instId"`
+			ClOrdID string `json:"clOrdId"`
+			Side    string `json:"side"`
+			OrdType string `json:"ordType"`
+			Px      string `json:"px"`
+			Sz      string `json:"sz"`
+			FillSz  string `json:"fillSz"`
+			FillPx  string `json:"avgPx"` // use avgPx for fill price
+			State   string `json:"state"`
+			TS      string `json:"uTime"`
+		}
+		if err := json.Unmarshal(wsMsg.Data, &orders); err != nil {
+			continue
+		}
+
+		for _, ord := range orders {
+			// Only handle fully filled orders
+			if ord.State != "filled" {
+				continue
+			}
+			fillSz := parseFloat(ord.FillSz)
+			if fillSz == 0 {
+				continue
+			}
+
+			ts, _ := strconv.ParseInt(ord.TS, 10, 64)
+			trade := exchange.Trade{
+				ID:        ord.OrdID,
+				OrderID:   ord.OrdID,
+				Pair:      convertInstID(ord.InstID),
+				Side:      exchange.OrderSide(ord.Side),
+				Price:     parseFloat(ord.FillPx),
+				Amount:    fillSz,
+				Timestamp: time.UnixMilli(ts),
+			}
+
+			log.Info().
+				Str("order_id", ord.OrdID).
+				Str("side", ord.Side).
+				Float64("price", trade.Price).
+				Float64("amount", trade.Amount).
+				Msg("Order filled via WS")
+
+			if o.orderHandler != nil {
+				o.orderHandler(trade)
+			}
+		}
+	}
+}
+
+// reconnectPrivateWS reconnects and re-authenticates the private WebSocket.
+func (o *OKXExchange) reconnectPrivateWS() {
+	o.wsPrivMu.Lock()
+	defer o.wsPrivMu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURLPrivate, nil)
+		if err != nil {
+			log.Error().Err(err).Int("attempt", i+1).Msg("Private WS reconnect failed")
+			time.Sleep(time.Duration(i+1) * 3 * time.Second)
+			continue
+		}
+
+		// Login
+		ts := WSTimestamp()
+		sign := Sign(ts, "GET", "/users/self/verify", "", o.config.SecretKey)
+		loginMsg := map[string]interface{}{
+			"op": "login",
+			"args": []map[string]string{
+				{
+					"apiKey":     o.config.APIKey,
+					"passphrase": o.config.Passphrase,
+					"timestamp":  ts,
+					"sign":       sign,
+				},
+			},
+		}
+		if err := conn.WriteJSON(loginMsg); err != nil {
+			conn.Close()
+			continue
+		}
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		var lr struct{ Event string `json:"event"` }
+		json.Unmarshal(msg, &lr)
+		if lr.Event == "error" {
+			conn.Close()
+			continue
+		}
+
+		// Re-subscribe orders
+		subMsg := map[string]interface{}{
+			"op": "subscribe",
+			"args": []map[string]string{
+				{"channel": "orders", "instType": "SWAP"},
+			},
+		}
+		if err := conn.WriteJSON(subMsg); err != nil {
+			conn.Close()
+			continue
+		}
+
+		o.wsPrivConn = conn
+		log.Info().Msg("Private WS reconnected and authenticated")
+		return
+	}
+	log.Error().Msg("Private WS reconnect exhausted all retries")
+}
+
 // Close shuts down the exchange client.
 func (o *OKXExchange) Close() error {
+	close(o.wsDone)
 	if o.wsConn != nil {
-		return o.wsConn.Close()
+		o.wsConn.Close()
+	}
+	if o.wsPrivConn != nil {
+		o.wsPrivConn.Close()
 	}
 	o.httpClient.CloseIdleConnections()
 	return nil

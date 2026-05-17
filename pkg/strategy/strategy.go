@@ -50,6 +50,8 @@ type Strategy interface {
 	Stop()
 	// IsActive returns whether the strategy is running.
 	IsActive() bool
+	// Stats returns current strategy statistics.
+	Stats() map[string]interface{}
 }
 
 // BaseStrategy provides common functionality for all strategies.

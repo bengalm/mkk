@@ -181,6 +181,7 @@ type Exchange interface {
 	SubscribeTicker(pair string, handler func(Ticker)) error
 	SubscribeCandles(pair, timeframe string, handler func(Candle)) error
 	SubscribeOrderBook(pair string, handler func(OrderBook)) error
+	SubscribeOrders(handler func(Trade)) error
 
 	// Lifecycle
 	Close() error

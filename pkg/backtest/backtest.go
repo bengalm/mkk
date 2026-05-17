@@ -308,4 +308,7 @@ func (m *mockExchange) SubscribeCandles(pair, timeframe string, handler func(exc
 func (m *mockExchange) SubscribeOrderBook(pair string, handler func(exchange.OrderBook)) error {
 	return nil
 }
+func (m *mockExchange) SubscribeOrders(handler func(exchange.Trade)) error {
+	return nil
+}
 func (m *mockExchange) Close() error { return nil }

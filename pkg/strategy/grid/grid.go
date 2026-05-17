@@ -440,60 +440,199 @@ func (g *GridStrategy) calculateGridPrices() {
 		Msg("Geometric grid prices calculated")
 }
 
-func (g *GridStrategy) detectTrend() error {
+// ── Multi-Indicator Trend Detection ──
+
+// trendScore holds individual indicator signals and the composite score.
+type trendScore struct {
+	EMAAlignment int     // -1/0/+1  (bearish/neutral/bullish)
+	EMACross     int     // -1/0/+1  (death cross/neutral/golden cross)
+	RSI          int     // -1/0/+1  (overbought/neutral/oversold → contrarian)
+	MACD         int     // -1/0/+1
+	SuperTrend   int     // -1/0/+1
+	Volume       int     // -1/0/+1  (volume rising on bear/bull candle)
+	Total        int     // composite: sum of above (-6 to +6)
+	Confidence   float64 // 0.0 - 1.0
+	Reason       string
+}
+
+// calcTrendScore evaluates multiple indicators and returns a composite score.
+func (g *GridStrategy) calcTrendScore() (*trendScore, error) {
+	// Fetch enough candles for all indicators (EMA200 needs 200+)
 	candles, err := g.Exchange().GetCandles(exchange.CandleRequest{
 		Pair:      g.pair,
 		Timeframe: g.trendTF,
-		Limit:     g.emaSlow + 10,
+		Limit:     220,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(candles) < g.emaSlow {
-		return fmt.Errorf("not enough candles: %d", len(candles))
+	if len(candles) < 100 {
+		return nil, fmt.Errorf("not enough candles: %d", len(candles))
 	}
 
 	closes := make([]float64, len(candles))
+	highs := make([]float64, len(candles))
+	lows := make([]float64, len(candles))
+	volumes := make([]float64, len(candles))
 	for i, c := range candles {
 		closes[i] = c.Close
+		highs[i] = c.High
+		lows[i] = c.Low
+		volumes[i] = c.Volume
 	}
 
-	emaF := calcEMA(closes, g.emaFast)
-	emaS := calcEMA(closes, g.emaSlow)
+	sc := &trendScore{}
+	var reasons []string
+	n := len(closes)
+	lastClose := closes[n-1]
 
-	prevTrend := g.currentTrend
+	// ── 1. EMA Alignment (20/50/200) ──
+	ema20 := calcEMA(closes, 20)
+	ema50 := calcEMA(closes, 50)
+	ema200 := calcEMA(closes, 200)
+
+	if ema20 > ema50 && ema50 > ema200 {
+		sc.EMAAlignment = 1
+		reasons = append(reasons, "EMA多头排列")
+	} else if ema20 < ema50 && ema50 < ema200 {
+		sc.EMAAlignment = -1
+		reasons = append(reasons, "EMA空头排列")
+	} else {
+		sc.EMAAlignment = 0
+		reasons = append(reasons, "EMA交叉")
+	}
+
+	// ── 2. EMA Cross (fast vs slow momentum) ──
+	emaFast := calcEMA(closes, g.emaFast)
+	emaSlow := calcEMA(closes, g.emaSlow)
+	ratio := (emaFast - emaSlow) / emaSlow
 	threshold := 0.003
-	ratio := (emaF - emaS) / emaS
-
 	if ratio > threshold {
+		sc.EMACross = 1
+	} else if ratio < -threshold {
+		sc.EMACross = -1
+	}
+
+	// ── 3. RSI (14-period) ──
+	rsi := calcRSI(closes, 14)
+	if rsi < 30 {
+		sc.RSI = 1  // oversold → potential bounce up
+		reasons = append(reasons, fmt.Sprintf("RSI超卖(%.0f)", rsi))
+	} else if rsi > 70 {
+		sc.RSI = -1 // overbought → potential drop
+		reasons = append(reasons, fmt.Sprintf("RSI超买(%.0f)", rsi))
+	} else {
+		sc.RSI = 0
+	}
+
+	// ── 4. MACD ──
+	_, _, hist := calcMACD(closes, 12, 26, 9)
+	if hist > 0 {
+		sc.MACD = 1
+		if len(reasons) < 8 {
+			reasons = append(reasons, fmt.Sprintf("MACD多头(%.2f)", hist))
+		}
+	} else if hist < 0 {
+		sc.MACD = -1
+		if len(reasons) < 8 {
+			reasons = append(reasons, fmt.Sprintf("MACD空头(%.2f)", hist))
+		}
+	}
+
+	// ── 5. SuperTrend (10, ATR×3) ──
+	stDir, stVal := calcSuperTrend(highs, lows, closes, 10, 3.0)
+	if stDir == 1 {
+		sc.SuperTrend = 1
+		reasons = append(reasons, fmt.Sprintf("SuperTrend多头(%.2f)", stVal))
+	} else {
+		sc.SuperTrend = -1
+		reasons = append(reasons, fmt.Sprintf("SuperTrend空头(%.2f)", stVal))
+	}
+
+	// ── 6. Volume trend ──
+	volRecent := sliceAvg(volumes[n-5:])
+	volPrior := sliceAvg(volumes[n-20 : n-5])
+	if volRecent > volPrior*1.3 {
+		// Volume rising → confirm candle direction
+		if closes[n-1] > closes[n-2] {
+			sc.Volume = 1
+			reasons = append(reasons, "放量上涨")
+		} else {
+			sc.Volume = -1
+			reasons = append(reasons, "放量下跌")
+		}
+	}
+
+	// ── Composite score ──
+	sc.Total = sc.EMAAlignment + sc.EMACross + sc.RSI + sc.MACD + sc.SuperTrend + sc.Volume
+
+	// Confidence: absolute score / 6
+	absScore := math.Abs(float64(sc.Total))
+	sc.Confidence = math.Min(absScore/6.0, 1.0)
+	if sc.Confidence < 0.33 {
+		sc.Confidence = 0.33 // minimum confidence if any signal exists
+	}
+
+	// Direction label
+	dirLabel := "neutral"
+	if sc.Total >= 2 {
+		dirLabel = "long"
+	} else if sc.Total <= -2 {
+		dirLabel = "short"
+	}
+
+	sc.Reason = fmt.Sprintf("程序判断: %s (得分%d/6, %s, EMA20=%.2f/50=%.2f/200=%.2f, RSI=%.0f, MACD=%.2f, ST=%.2f, 价格=%.2f)",
+		dirLabel, sc.Total, strings.Join(reasons, ", "),
+		ema20, ema50, ema200, rsi, hist, stVal, lastClose)
+
+	return sc, nil
+}
+
+// detectTrend evaluates multiple indicators and updates grid direction.
+// This is the programmatic fallback when AI signal is stale/absent.
+func (g *GridStrategy) detectTrend() error {
+	sc, err := g.calcTrendScore()
+	if err != nil {
+		return err
+	}
+
+	prevDir := g.effectiveDir
+	prevTrend := g.currentTrend
+
+	// Determine direction from composite score
+	switch {
+	case sc.Total >= 2:
 		g.currentTrend = TrendUp
 		g.effectiveDir = DirLong
-	} else if ratio < -threshold {
+	case sc.Total <= -2:
 		g.currentTrend = TrendDown
 		g.effectiveDir = DirShort
-	} else {
+	default:
 		g.currentTrend = TrendSide
 		g.effectiveDir = DirBoth
 	}
 
 	g.lastTrendChk = time.Now()
 
-	if prevTrend != "" && prevTrend != g.currentTrend {
+	log.Info().
+		Int("score", sc.Total).
+		Float64("confidence", sc.Confidence).
+		Str("direction", string(g.effectiveDir)).
+		Str("reason", sc.Reason).
+		Msg("Programmatic trend check")
+
+	// Rebuild grid if direction changed
+	if prevTrend != "" && (prevDir != g.effectiveDir || prevTrend != g.currentTrend) {
 		g.notify("trend_change", GridNotification{
 			Type:      "trend_change",
 			Pair:      g.pair,
 			Trend:     string(g.currentTrend),
 			Direction: string(g.effectiveDir),
-			Reason:    fmt.Sprintf("EMA趋势变化: %s→%s (ema20=%.2f, ema50=%.2f)", prevTrend, g.currentTrend, emaF, emaS),
+			Reason:    fmt.Sprintf("程序趋势变化: %s→%s (%s)", prevDir, g.effectiveDir, sc.Reason),
 		})
-		return g.rebuildGrid("trend_change")
+		return g.rebuildGrid("program_trend_change")
 	}
 
-	log.Info().
-		Float64("ema_fast", emaF).
-		Float64("ema_slow", emaS).
-		Str("trend", string(g.currentTrend)).
-		Msg("Trend check done")
 	return nil
 }
 
@@ -681,12 +820,22 @@ func (g *GridStrategy) OnCandle(candle exchange.Candle) {
 			}
 		}
 
-		// Trend re-detection (only if no AI signal)
+		// Trend detection: use AI if fresh, otherwise programmatic
 		if g.autoTrend {
 			g.aiMu.RLock()
-			hasAI := g.lastAISignal != nil
+			aiSignal := g.lastAISignal
 			g.aiMu.RUnlock()
-			if !hasAI {
+
+			useAI := false
+			if aiSignal != nil {
+				ts, err := time.Parse(time.RFC3339, aiSignal.Timestamp)
+				if err == nil && time.Since(ts) < 2*time.Hour {
+					useAI = true
+				}
+			}
+
+			if !useAI {
+				// AI signal absent or stale (>2h) → programmatic multi-indicator check
 				_ = g.detectTrend()
 			}
 		}
@@ -1357,4 +1506,179 @@ func calcEMA(closes []float64, period int) float64 {
 		ema = closes[i]*k + ema*(1-k)
 	}
 	return ema
+}
+
+// calcRSI computes the Relative Strength Index.
+func calcRSI(closes []float64, period int) float64 {
+	if len(closes) < period+1 {
+		return 50
+	}
+	var avgGain, avgLoss float64
+	for i := 1; i <= period; i++ {
+		delta := closes[i] - closes[i-1]
+		if delta > 0 {
+			avgGain += delta
+		} else {
+			avgLoss -= delta
+		}
+	}
+	avgGain /= float64(period)
+	avgLoss /= float64(period)
+
+	for i := period + 1; i < len(closes); i++ {
+		delta := closes[i] - closes[i-1]
+		gain, loss := 0.0, 0.0
+		if delta > 0 {
+			gain = delta
+		} else {
+			loss = -delta
+		}
+		avgGain = (avgGain*float64(period-1) + gain) / float64(period)
+		avgLoss = (avgLoss*float64(period-1) + loss) / float64(period)
+	}
+
+	if avgLoss == 0 {
+		return 100
+	}
+	rs := avgGain / avgLoss
+	return 100 - 100/(1+rs)
+}
+
+// calcMACD returns (macdLine, signalLine, histogram).
+func calcMACD(closes []float64, fast, slow, signal int) (float64, float64, float64) {
+	if len(closes) < slow+signal {
+		return 0, 0, 0
+	}
+	// Calculate full EMA series for fast and slow
+	fastEMA := calcEMASeries(closes, fast)
+	slowEMA := calcEMASeries(closes, slow)
+
+	// MACD line = fast EMA - slow EMA (aligned at end)
+	macdVals := make([]float64, 0, len(fastEMA))
+	start := len(slowEMA) - len(fastEMA) // slowEMA is shorter
+	if start < 0 {
+		start = 0
+	}
+	minLen := len(fastEMA)
+	if len(slowEMA)-start < minLen {
+		minLen = len(slowEMA) - start
+	}
+	for i := 0; i < minLen; i++ {
+		macdVals = append(macdVals, fastEMA[len(fastEMA)-minLen+i]-slowEMA[len(slowEMA)-minLen+i])
+	}
+
+	if len(macdVals) < signal {
+		return 0, 0, 0
+	}
+
+	signalLine := calcEMA(macdVals, signal)
+	macdLine := macdVals[len(macdVals)-1]
+	hist := macdLine - signalLine
+
+	return macdLine, signalLine, hist
+}
+
+// calcEMASeries returns the full EMA series.
+func calcEMASeries(closes []float64, period int) []float64 {
+	if len(closes) < period {
+		return closes
+	}
+	result := make([]float64, len(closes))
+	k := 2.0 / float64(period+1)
+
+	// SMA seed
+	var sum float64
+	for i := 0; i < period; i++ {
+		sum += closes[i]
+	}
+	result[period-1] = sum / float64(period)
+
+	for i := period; i < len(closes); i++ {
+		result[i] = closes[i]*k + result[i-1]*(1-k)
+	}
+	return result[period-1:]
+}
+
+// calcSuperTrend returns (direction: +1=bull/-1=bear, value).
+func calcSuperTrend(highs, lows, closes []float64, period int, mult float64) (int, float64) {
+	n := len(closes)
+	if n < period+1 {
+		return 1, closes[n-1]
+	}
+
+	// Calculate ATR series
+	atr := make([]float64, n)
+	for i := 1; i < n; i++ {
+		tr := math.Max(highs[i]-lows[i],
+			math.Max(math.Abs(highs[i]-closes[i-1]),
+				math.Abs(lows[i]-closes[i-1])))
+		atr[i] = tr
+	}
+	// Smooth ATR
+	for i := period; i < n; i++ {
+		var sum float64
+		for j := i - period + 1; j <= i; j++ {
+			sum += atr[j]
+		}
+		atr[i] = sum / float64(period)
+	}
+
+	// Calculate SuperTrend bands
+	var upperBand, lowerBand float64
+	var prevUpper, prevLower float64
+	dir := 1
+
+	for i := period; i < n; i++ {
+		hl2 := (highs[i] + lows[i]) / 2
+		rawUpper := hl2 + mult*atr[i]
+		rawLower := hl2 - mult*atr[i]
+
+		// Adjust bands
+		if i > period && prevLower != 0 {
+			if rawLower < prevLower || closes[i-1] < prevLower {
+				lowerBand = rawLower
+			} else {
+				lowerBand = prevLower
+			}
+			if rawUpper > prevUpper || closes[i-1] > prevUpper {
+				upperBand = rawUpper
+			} else {
+				upperBand = prevUpper
+			}
+		} else {
+			upperBand = rawUpper
+			lowerBand = rawLower
+		}
+
+		// Determine direction
+		if i == period {
+			dir = 1
+		} else if prevUpper != 0 && closes[i] > prevUpper {
+			dir = 1
+		} else if prevLower != 0 && closes[i] < prevLower {
+			dir = -1
+		}
+		// else keep previous dir
+
+		prevUpper = upperBand
+		prevLower = lowerBand
+	}
+
+	stVal := lowerBand
+	if dir == -1 {
+		stVal = upperBand
+	}
+	return dir, stVal
+}
+
+// sliceAvg returns the average of a float64 slice.
+func sliceAvg(s []float64) float64 {
+	if len(s) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, v := range s {
+		sum += v
+	}
+	return sum / float64(len(s))
 }

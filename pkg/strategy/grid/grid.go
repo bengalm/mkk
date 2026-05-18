@@ -100,6 +100,13 @@ type GridStrategy struct {
 	atrPeriod  int
 	atrMult    float64
 	currentATR float64
+
+	// Equity cache
+	equityCache    float64
+	equityCacheAt  time.Time
+
+	// Grid state mutex (WS OnFill vs ticker OnTick)
+	gridMu sync.RWMutex
 	autoRange  bool
 
 	// Auto shift
@@ -212,7 +219,7 @@ func (g *GridStrategy) Init(config map[string]interface{}, ex exchange.Exchange,
 	}
 
 	// Stop-loss
-	g.stopLossPrice = math.Round((g.lowPrice-g.currentATR*1.5)*100) / 100
+	g.stopLossPrice = g.calcStopLoss()
 
 	// Load AI signal if available, otherwise detect trend via EMA
 	if g.autoTrend {
@@ -748,7 +755,7 @@ func (g *GridStrategy) OnTick(ticker exchange.Ticker) {
 
 	// ── Drawdown kill switch ──
 	if g.maxDrawdownPct > 0 && g.startEquity > 0 {
-		equity := g.getEquity()
+		equity := g.getEquityCached()
 		drawdown := (g.startEquity - equity) / g.startEquity
 		if drawdown >= g.maxDrawdownPct {
 			log.Warn().
@@ -840,7 +847,7 @@ func (g *GridStrategy) OnCandle(candle exchange.Candle) {
 			}
 		}
 
-		g.stopLossPrice = math.Round((g.lowPrice-g.currentATR*1.5)*100) / 100
+		g.stopLossPrice = g.calcStopLoss()
 
 		// Dynamic spacing adjustment
 		g.adjustSpacing()
@@ -1069,7 +1076,7 @@ func (g *GridStrategy) closeAllPositions() {
 			continue
 		}
 		side := exchange.Sell
-		if pos.Side == "short" {
+		if pos.Side == exchange.Sell { // short position → close with buy
 			side = exchange.Buy
 		}
 		_, err := g.Exchange().PlaceOrder(exchange.OrderRequest{
@@ -1095,6 +1102,34 @@ func (g *GridStrategy) getEquity() float64 {
 	return bals[0].Total
 }
 
+// getEquityCached returns cached equity (refreshes every 30s to avoid API rate limits).
+func (g *GridStrategy) getEquityCached() float64 {
+	if time.Since(g.equityCacheAt) > 30*time.Second {
+		g.equityCache = g.getEquity()
+		g.equityCacheAt = time.Now()
+	}
+	return g.equityCache
+}
+
+// calcStopLoss returns direction-aware stop-loss price.
+// Short: SL above grid (price rises = loss). Long: SL below grid (price drops = loss).
+func (g *GridStrategy) calcStopLoss() float64 {
+	if g.currentATR <= 0 {
+		return 0
+	}
+	switch g.effectiveDir {
+	case DirShort:
+		// Short position loses when price rises → SL above highPrice
+		return math.Round((g.highPrice+g.currentATR*1.5)*100) / 100
+	case DirLong:
+		// Long position loses when price drops → SL below lowPrice
+		return math.Round((g.lowPrice-g.currentATR*1.5)*100) / 100
+	default:
+		// Both/neutral: use lower side as default risk boundary
+		return math.Round((g.lowPrice-g.currentATR*1.5)*100) / 100
+	}
+}
+
 func (g *GridStrategy) rebuildGrid(reason string) error {
 	log.Info().Str("reason", reason).Msg("Rebuilding grid")
 
@@ -1115,7 +1150,7 @@ func (g *GridStrategy) rebuildGrid(reason string) error {
 		_ = g.calculateRange()
 	}
 
-	g.stopLossPrice = math.Round((g.lowPrice-g.currentATR*1.5)*100) / 100
+	g.stopLossPrice = g.calcStopLoss()
 	g.calculateGridPrices()
 	g.rebuildCount++
 
@@ -1165,7 +1200,7 @@ func (g *GridStrategy) Stats() map[string]interface{} {
 		fillRate = float64(g.totalTrades) / runtime.Hours()
 		pnlPerTrade = g.profit / float64(g.totalTrades)
 	}
-	equity := g.getEquity()
+	equity := g.getEquityCached()
 	if g.startEquity > 0 {
 		equityReturn = (equity - g.startEquity) / g.startEquity * 100
 	}
@@ -1259,7 +1294,7 @@ func (g *GridStrategy) handleBreakout(price float64) {
 	}
 
 	// If position is small relative to equity, widen grid
-	equity := g.getEquity()
+	equity := g.getEquityCached()
 	if equity == 0 {
 		return
 	}
@@ -1317,7 +1352,7 @@ func (g *GridStrategy) handleBreakoutHedge(price float64, above bool, positions 
 		}
 		hedgeQty := pos.Size * 0.3
 		hedgeSide := exchange.Sell
-		if pos.Side == "short" {
+		if pos.Side == exchange.Sell { // short position → hedge with buy
 			hedgeSide = exchange.Buy
 		}
 		_, err := g.Exchange().PlaceOrder(exchange.OrderRequest{

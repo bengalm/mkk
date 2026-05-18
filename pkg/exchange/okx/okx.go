@@ -42,9 +42,10 @@ type OKXExchange struct {
 	wsPrivMu      sync.Mutex
 	simulated     string                 // "1" for demo trading
 	handlers      map[string]func(json.RawMessage) // public WS channel→handler
-	orderHandlers []func(exchange.Trade)            // private WS order fill handlers
-	orderMu       sync.Mutex                         // protects orderHandlers
-	wsDone        chan struct{}                       // signal to stop WS read loops
+	orderHandlers   []func(exchange.Trade)            // private WS order fill handlers
+	orderMu         sync.Mutex                         // protects orderHandlers + dispatchedOrders
+	dispatchedOrders map[string]bool                   // dedup: orderID → dispatched
+	wsDone          chan struct{}                       // signal to stop WS read loops
 	// Fill reconciliation
 	reconcileMu     sync.Mutex
 	lastReconcileTS int64 // unix seconds of last successful reconciliation
@@ -66,8 +67,9 @@ func New(cfg Config) (*OKXExchange, error) {
 			}
 			return "0"
 		}(),
-		handlers:    make(map[string]func(json.RawMessage)),
-		wsDone:      make(chan struct{}),
+		handlers:          make(map[string]func(json.RawMessage)),
+		dispatchedOrders:  make(map[string]bool),
+		wsDone:            make(chan struct{}),
 	}, nil
 }
 
@@ -853,6 +855,13 @@ func (o *OKXExchange) SubscribeOrders(handler func(exchange.Trade)) error {
 // dispatchFill sends a fill trade to all registered handlers.
 func (o *OKXExchange) dispatchFill(trade exchange.Trade) {
 	o.orderMu.Lock()
+	// Dedup: skip if this order was already dispatched
+	if o.dispatchedOrders[trade.OrderID] {
+		o.orderMu.Unlock()
+		log.Debug().Str("order_id", trade.OrderID).Msg("Fill dedup: skipping already dispatched")
+		return
+	}
+	o.dispatchedOrders[trade.OrderID] = true
 	handlers := make([]func(exchange.Trade), len(o.orderHandlers))
 	copy(handlers, o.orderHandlers)
 	o.orderMu.Unlock()

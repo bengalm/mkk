@@ -204,6 +204,11 @@ func (o *OKXExchange) GetCandles(req exchange.CandleRequest) ([]exchange.Candle,
 		})
 	}
 
+	// OKX returns candles newest-first; reverse to oldest-first for indicators
+	for i, j := 0, len(candles)-1; i < j; i, j = i+1, j-1 {
+		candles[i], candles[j] = candles[j], candles[i]
+	}
+
 	return candles, nil
 }
 

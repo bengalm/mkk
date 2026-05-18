@@ -1249,17 +1249,17 @@ func (g *GridStrategy) Stats() map[string]interface{} {
 		equityReturn = (equity - g.startEquity) / g.startEquity * 100
 	}
 
-	// Inventory
+	// Inventory + last price
 	inventorySize := 0.0
 	inventoryPct := 0.0
+	lastPrice := 0.0
 	positions, _ := g.Exchange().GetPositions(g.pair)
 	for _, p := range positions {
 		inventorySize += p.Size
 	}
-	if equity > 0 {
-		// inventoryPct = position notional / equity
-		// need current price for notional
-		if ticker, err := g.Exchange().GetTicker(g.pair); err == nil {
+	if ticker, err := g.Exchange().GetTicker(g.pair); err == nil {
+		lastPrice = ticker.Last
+		if equity > 0 {
 			inventoryPct = (inventorySize * ticker.Last) / equity * 100
 		}
 	}
@@ -1293,6 +1293,7 @@ func (g *GridStrategy) Stats() map[string]interface{} {
 		"inventory_size":  math.Round(inventorySize*1000) / 1000,
 		"inventory_pct":   math.Round(inventoryPct*10) / 10,
 		"start_equity":    math.Round(g.startEquity*100) / 100,
+		"last_price":      lastPrice,
 	}
 }
 
@@ -1536,8 +1537,6 @@ func (g *GridStrategy) LoadState() error {
 	g.lowPrice = state.LowPrice
 	g.spacingPct = state.SpacingPct
 	g.effectiveDir = Direction(state.EffectiveDir)
-	g.orders = state.Orders
-	g.activeOrders = state.ActiveOrders
 	g.profit = state.Profit
 	g.totalTrades = state.TotalTrades
 	g.stopLossPrice = state.StopLossPrice
@@ -1546,11 +1545,27 @@ func (g *GridStrategy) LoadState() error {
 	g.startTime = state.StartTime
 	g.rebuildCount = state.RebuildCount
 
+	// Rebuild order mappings from live exchange orders instead of stale IDs
+	g.orders = make(map[float64]string)
+	g.activeOrders = make(map[string]bool)
+
+	liveOrders, err := g.Exchange().GetOpenOrders(g.pair)
+	if err != nil {
+		log.Warn().Err(err).Msg("LoadState: failed to get live orders, will rebuild grid")
+		return nil // grid will rebuild on next tick
+	}
+
+	for _, o := range liveOrders {
+		g.orders[o.Price] = o.ID
+		g.activeOrders[o.ID] = true
+	}
+
 	log.Info().
 		Str("pair", g.pair).
 		Float64("profit", g.profit).
 		Int("trades", g.totalTrades).
-		Msg("Grid state restored from file")
+		Int("live_orders", len(liveOrders)).
+		Msg("Grid state restored, order mappings rebuilt from live orders")
 
 	return nil
 }

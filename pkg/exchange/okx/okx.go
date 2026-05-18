@@ -464,6 +464,84 @@ func (o *OKXExchange) PlaceOrder(req exchange.OrderRequest) (*exchange.Order, er
 	}, nil
 }
 
+// BatchPlaceOrders places up to 20 orders in a single API call.
+func (o *OKXExchange) BatchPlaceOrders(reqs []exchange.OrderRequest) ([]*exchange.Order, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+	// OKX allows max 20 orders per batch
+	if len(reqs) > 20 {
+		reqs = reqs[:20]
+	}
+
+	orders := make([]map[string]interface{}, 0, len(reqs))
+	for _, req := range reqs {
+		instID := convertPair(req.Pair)
+		tdMode := "cross"
+		posSide := "net"
+		if req.TdMode != "" {
+			tdMode = req.TdMode
+		} else if strings.HasSuffix(instID, "-SWAP") || strings.HasSuffix(instID, "-FUTURES") {
+			tdMode = "isolated"
+		}
+		if req.PosSide != "" {
+			posSide = req.PosSide
+		}
+		item := map[string]interface{}{
+			"instId":  instID,
+			"tdMode":  tdMode,
+			"side":    string(req.Side),
+			"ordType": string(req.Type),
+			"sz":      fmt.Sprintf("%.8f", req.Amount),
+			"posSide": posSide,
+		}
+		if req.Price > 0 {
+			item["px"] = fmt.Sprintf("%.8f", req.Price)
+		}
+		if req.ClientID != "" {
+			item["clOrdId"] = req.ClientID
+		}
+		if req.ReduceOnly {
+			item["reduceOnly"] = true
+		}
+		orders = append(orders, item)
+	}
+
+	data, err := o.request("POST", "/api/v5/trade/batch-orders", orders)
+	if err != nil {
+		return nil, fmt.Errorf("batch order failed: %w", err)
+	}
+
+	var results []struct {
+		OrdID   string `json:"ordId"`
+		ClOrdID string `json:"clOrdId"`
+		SCode   string `json:"sCode"`
+		SMsg    string `json:"sMsg"`
+	}
+	if err := json.Unmarshal(data, &results); err != nil {
+		return nil, fmt.Errorf("parse batch response: %w", err)
+	}
+
+	out := make([]*exchange.Order, 0, len(results))
+	for i, r := range results {
+		if r.SCode != "0" {
+			log.Warn().Str("scode", r.SCode).Str("smsg", r.SMsg).Int("index", i).Msg("batch order item rejected")
+			continue
+		}
+		req := reqs[i]
+		out = append(out, &exchange.Order{
+			ID:       r.OrdID,
+			Pair:     req.Pair,
+			Side:     req.Side,
+			Type:     req.Type,
+			Price:    req.Price,
+			Amount:   req.Amount,
+			Status:   exchange.StatusNew,
+		})
+	}
+	return out, nil
+}
+
 // CancelOrder cancels an existing order.
 func (o *OKXExchange) CancelOrder(pair, orderID string) error {
 	instID := convertPair(pair)

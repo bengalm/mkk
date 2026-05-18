@@ -294,6 +294,13 @@ func (m *mockExchange) GetPositions(pairs ...string) ([]exchange.Position, error
 func (m *mockExchange) PlaceOrder(req exchange.OrderRequest) (*exchange.Order, error) {
 	return &exchange.Order{ID: "mock", Status: exchange.StatusFilled}, nil
 }
+func (m *mockExchange) BatchPlaceOrders(reqs []exchange.OrderRequest) ([]*exchange.Order, error) {
+	out := make([]*exchange.Order, len(reqs))
+	for i := range reqs {
+		out[i] = &exchange.Order{ID: fmt.Sprintf("mock-%d", i), Status: exchange.StatusFilled}
+	}
+	return out, nil
+}
 func (m *mockExchange) CancelOrder(pair, orderID string) error { return nil }
 func (m *mockExchange) GetOrder(pair, orderID string) (*exchange.Order, error) {
 	return nil, nil

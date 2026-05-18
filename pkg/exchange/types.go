@@ -173,6 +173,7 @@ type Exchange interface {
 
 	// Trading
 	PlaceOrder(req OrderRequest) (*Order, error)
+	BatchPlaceOrders(reqs []OrderRequest) ([]*Order, error)
 	CancelOrder(pair, orderID string) error
 	GetOrder(pair, orderID string) (*Order, error)
 	GetOpenOrders(pair string) ([]Order, error)

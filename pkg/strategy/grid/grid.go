@@ -655,30 +655,74 @@ func (g *GridStrategy) placeGridOrders() error {
 		Int("grid_levels", len(g.gridPrices)).
 		Msg("Placing geometric grid orders")
 
-	placed := 0
+	// Collect orders for batch placement
+	var batchReqs []exchange.OrderRequest
+	var batchPrices []float64
+
 	for _, price := range g.gridPrices {
+		var side exchange.OrderSide
+		shouldPlace := false
+
 		switch g.effectiveDir {
 		case DirLong:
 			if price < ticker.Last {
-				g.placeOrderAt(price, exchange.Buy, false)
-				placed++
+				side = exchange.Buy
+				shouldPlace = true
 			}
 		case DirShort:
 			if price > ticker.Last {
-				g.placeOrderAt(price, exchange.Sell, false)
-				placed++
+				side = exchange.Sell
+				shouldPlace = true
 			}
 		case DirBoth:
 			if price >= ticker.Last {
-				g.placeOrderAt(price, exchange.Sell, false)
+				side = exchange.Sell
 			} else {
-				g.placeOrderAt(price, exchange.Buy, false)
+				side = exchange.Buy
 			}
-			placed++
+			shouldPlace = true
+		}
+
+		if shouldPlace {
+			batchReqs = append(batchReqs, exchange.OrderRequest{
+				Pair:       g.pair,
+				Side:       side,
+				Type:       exchange.OrderLimit,
+				Price:      price,
+				Amount:     g.quantityPerGrid,
+				ReduceOnly: false,
+			})
+			batchPrices = append(batchPrices, price)
 		}
 	}
 
-	log.Info().Int("placed", placed).Msg("Grid orders placed")
+	if len(batchReqs) == 0 {
+		log.Info().Msg("No grid orders to place")
+		return nil
+	}
+
+	// Try batch placement first
+	orders, err := g.Exchange().BatchPlaceOrders(batchReqs)
+	if err != nil || len(orders) == 0 {
+		log.Warn().Err(err).Msg("Batch placement failed, falling back to sequential")
+		// Fallback: place individually
+		for i, req := range batchReqs {
+			g.placeOrderAt(batchPrices[i], req.Side, false)
+		}
+		return nil
+	}
+
+	// Record successful batch orders
+	g.gridMu.Lock()
+	for i, order := range orders {
+		if i < len(batchPrices) {
+			g.orders[batchPrices[i]] = order.ID
+			g.activeOrders[order.ID] = true
+		}
+	}
+	g.gridMu.Unlock()
+
+	log.Info().Int("placed", len(orders)).Msg("Grid orders placed (batch)")
 	return nil
 }
 

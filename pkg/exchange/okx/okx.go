@@ -945,6 +945,11 @@ func (o *OKXExchange) dispatchFill(trade exchange.Trade) {
 		return
 	}
 	o.dispatchedOrders[trade.OrderID] = true
+	// Prevent unbounded growth: clear if >1000 entries
+	if len(o.dispatchedOrders) > 1000 {
+		o.dispatchedOrders = make(map[string]bool)
+		o.dispatchedOrders[trade.OrderID] = true
+	}
 	handlers := make([]func(exchange.Trade), len(o.orderHandlers))
 	copy(handlers, o.orderHandlers)
 	o.orderMu.Unlock()

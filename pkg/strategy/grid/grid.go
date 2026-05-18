@@ -114,6 +114,7 @@ type GridStrategy struct {
 	shiftThreshold float64
 	lastBuildPrice float64
 	rebuildCount   int
+	lastRebuild    time.Time
 
 	// Stop-loss
 	stopLossPrice float64
@@ -439,6 +440,10 @@ func (g *GridStrategy) calculateGridPrices() {
 		price = price * ratio
 	}
 
+	if len(g.gridPrices) == 0 {
+		log.Warn().Float64("low", g.lowPrice).Float64("high", g.highPrice).Msg("Grid produced 0 levels, skipping")
+		return
+	}
 	log.Info().
 		Int("levels", len(g.gridPrices)).
 		Float64("spacing_pct", g.spacingPct).
@@ -712,13 +717,12 @@ func (g *GridStrategy) placeGridOrders() error {
 		return nil
 	}
 
-	// Record successful batch orders
+	// Record successful batch orders (use order.Price, not batchPrices[i],
+	// because rejected orders are skipped and indices don't align)
 	g.gridMu.Lock()
-	for i, order := range orders {
-		if i < len(batchPrices) {
-			g.orders[batchPrices[i]] = order.ID
-			g.activeOrders[order.ID] = true
-		}
+	for _, order := range orders {
+		g.orders[order.Price] = order.ID
+		g.activeOrders[order.ID] = true
 	}
 	g.gridMu.Unlock()
 
@@ -740,8 +744,10 @@ func (g *GridStrategy) placeOrderAt(price float64, side exchange.OrderSide, redu
 		log.Error().Float64("price", price).Str("side", string(side)).Bool("ro", reduceOnly).Err(err).Msg("order failed")
 		return
 	}
+	g.gridMu.Lock()
 	g.orders[price] = order.ID
 	g.activeOrders[order.ID] = true
+	g.gridMu.Unlock()
 	log.Debug().Float64("price", price).Str("side", string(side)).Str("id", order.ID).Msg("order placed")
 }
 
@@ -903,7 +909,9 @@ func (g *GridStrategy) OnFill(trade exchange.Trade) {
 	if g.stopped || g.paused {
 		return
 	}
+	g.gridMu.Lock()
 	if !g.activeOrders[trade.OrderID] {
+		g.gridMu.Unlock()
 		return
 	}
 	delete(g.activeOrders, trade.OrderID)
@@ -916,6 +924,8 @@ func (g *GridStrategy) OnFill(trade exchange.Trade) {
 			break
 		}
 	}
+	g.gridMu.Unlock()
+
 	if filledPrice == 0 {
 		return
 	}
@@ -1019,7 +1029,8 @@ func (g *GridStrategy) handleShortFill(trade exchange.Trade, filledPrice float64
 		buyPrice := g.findNextLevelDown(filledPrice)
 		if buyPrice > 0 {
 			g.placeOrderAt(buyPrice, exchange.Buy, true)
-			g.recordProfit(buyPrice, filledPrice)
+			// entry=sell@filledPrice(high), exit=buy@buyPrice(low) → recordProfit(high, low)
+			g.recordProfit(filledPrice, buyPrice)
 			log.Info().
 				Float64("sell", filledPrice).
 				Float64("buy_close", buyPrice).
@@ -1067,11 +1078,14 @@ func (g *GridStrategy) recordProfit(entryPrice, exitPrice float64) {
 
 func (g *GridStrategy) pauseGrid() {
 	g.paused = true
+	g.gridMu.Lock()
 	for orderID := range g.activeOrders {
 		_ = g.Exchange().CancelOrder(g.pair, orderID)
 	}
+	g.gridMu.Lock()
 	g.orders = make(map[float64]string)
 	g.activeOrders = make(map[string]bool)
+	g.gridMu.Unlock()
 	log.Warn().Msg("Grid PAUSED")
 }
 
@@ -1175,8 +1189,16 @@ func (g *GridStrategy) calcStopLoss() float64 {
 }
 
 func (g *GridStrategy) rebuildGrid(reason string) error {
+	// Cooldown: skip if last rebuild was < 5 minutes ago
+	if time.Since(g.lastRebuild) < 5*time.Minute {
+		log.Debug().Str("reason", reason).Msg("Rebuild skipped (cooldown)")
+		return nil
+	}
+	g.lastRebuild = time.Now()
+
 	log.Info().Str("reason", reason).Msg("Rebuilding grid")
 
+	g.gridMu.Lock()
 	cancelled := 0
 	for orderID := range g.activeOrders {
 		if err := g.Exchange().CancelOrder(g.pair, orderID); err != nil {
@@ -1188,6 +1210,7 @@ func (g *GridStrategy) rebuildGrid(reason string) error {
 
 	g.orders = make(map[float64]string)
 	g.activeOrders = make(map[string]bool)
+	g.gridMu.Unlock()
 
 	if g.autoRange {
 		_ = g.calculateATR()

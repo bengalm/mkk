@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -339,8 +340,11 @@ func (o *OKXExchange) GetPositions(pairs ...string) ([]exchange.Position, error)
 			continue
 		}
 		side := exchange.Buy
-		if p.PosSide == "short" {
+		// Net mode: posSide="net", negative size = short position
+		// Hedge mode: posSide="long"/"short"
+		if p.PosSide == "short" || (p.PosSide == "net" && size < 0) {
 			side = exchange.Sell
+			size = math.Abs(size) // normalize to positive
 		}
 		ct, _ := strconv.ParseInt(p.CTime, 10, 64)
 		result = append(result, exchange.Position{

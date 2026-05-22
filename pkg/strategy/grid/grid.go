@@ -1198,6 +1198,60 @@ func (g *GridStrategy) rebuildGrid(reason string) error {
 
 	log.Info().Str("reason", reason).Msg("Rebuilding grid")
 
+	// ── Close opposite-direction position before switching ──
+	// If switching from short→long or long→short, close existing position first
+	if reason == "ai_signal_change" && g.effectiveDir != DirBoth {
+		positions, err := g.Exchange().GetPositions(g.pair)
+		if err == nil {
+			for _, pos := range positions {
+				if pos.Pair != g.pair || pos.Size == 0 {
+					continue
+				}
+				// OKX net mode: Sell side with positive size = short position
+				isShort := pos.Side == exchange.Sell
+				isLong := pos.Side == exchange.Buy
+
+				if g.effectiveDir == DirLong && isShort {
+					// Have short position but switching to long → close short
+					log.Warn().Float64("short_pos", pos.Size).Msg("Closing opposite short position for direction switch")
+					_, err := g.Exchange().PlaceOrder(exchange.OrderRequest{
+						Pair:   g.pair,
+						Side:   exchange.Buy, // buy to close short
+						Type:   exchange.OrderMarket,
+						Amount: pos.Size,
+					})
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to close opposite short position")
+					} else {
+						g.notify("position_closed", GridNotification{
+							Type:   "position_closed",
+							Pair:   g.pair,
+							Reason: fmt.Sprintf("方向切换平仓: short→long, 平掉 %.2f 张空单", pos.Size),
+						})
+					}
+				} else if g.effectiveDir == DirShort && isLong {
+					// Have long position but switching to short → close long
+					log.Warn().Float64("long_pos", pos.Size).Msg("Closing opposite long position for direction switch")
+					_, err := g.Exchange().PlaceOrder(exchange.OrderRequest{
+						Pair:   g.pair,
+						Side:   exchange.Sell, // sell to close long
+						Type:   exchange.OrderMarket,
+						Amount: pos.Size,
+					})
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to close opposite long position")
+					} else {
+						g.notify("position_closed", GridNotification{
+							Type:   "position_closed",
+							Pair:   g.pair,
+							Reason: fmt.Sprintf("方向切换平仓: long→short, 平掉 %.2f 张多单", pos.Size),
+						})
+					}
+				}
+			}
+		}
+	}
+
 	g.gridMu.Lock()
 	cancelled := 0
 	for orderID := range g.activeOrders {

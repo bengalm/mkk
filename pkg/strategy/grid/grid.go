@@ -931,11 +931,15 @@ func (g *GridStrategy) OnFill(trade exchange.Trade) {
 	}
 
 	// Determine if this is an opening or closing fill
+	// DirBoth: Sell=open short, Buy=close short (net mode)
 	isOpen := true
 	if g.effectiveDir == DirLong {
 		isOpen = trade.Side == exchange.Buy // buy=open, sell=close
 	} else if g.effectiveDir == DirShort {
 		isOpen = trade.Side == exchange.Sell // sell=open, buy=close
+	} else {
+		// DirBoth: Sell=open short, Buy=open long
+		isOpen = true
 	}
 
 	switch g.effectiveDir {
@@ -949,17 +953,31 @@ func (g *GridStrategy) OnFill(trade exchange.Trade) {
 
 	// Send notification
 	notifType := "fill_open"
-	side := "开多"
+	var side string
 	if !isOpen {
 		notifType = "fill_close"
 		if g.effectiveDir == DirShort {
 			side = "平空"
+		} else if g.effectiveDir == DirBoth {
+			// DirBoth: Buy close = 平空(closed short), Sell close = 平多(closed long)
+			if trade.Side == exchange.Buy {
+				side = "平空"
+			} else {
+				side = "平多"
+			}
 		} else {
 			side = "平多"
 		}
 	} else {
 		if g.effectiveDir == DirShort {
 			side = "开空"
+		} else if g.effectiveDir == DirBoth {
+			// DirBoth: Sell open = 开空, Buy open = 开多
+			if trade.Side == exchange.Sell {
+				side = "开空"
+			} else {
+				side = "开多"
+			}
 		} else {
 			side = "开多"
 		}
@@ -1050,17 +1068,27 @@ func (g *GridStrategy) handleShortFill(trade exchange.Trade, filledPrice float64
 }
 
 func (g *GridStrategy) handleBothFill(trade exchange.Trade, filledPrice float64) {
-	if trade.Side == exchange.Buy {
-		sellPrice := g.findNextLevelUp(filledPrice)
-		if sellPrice > 0 {
-			g.placeOrderAt(sellPrice, exchange.Sell, false)
-			g.recordProfit(filledPrice, sellPrice)
-		}
-	} else {
+	if trade.Side == exchange.Sell {
+		// Sell filled → opened short → place Buy close below (reduceOnly)
 		buyPrice := g.findNextLevelDown(filledPrice)
 		if buyPrice > 0 {
-			g.placeOrderAt(buyPrice, exchange.Buy, false)
-			g.recordProfit(buyPrice, filledPrice)
+			g.placeOrderAt(buyPrice, exchange.Buy, true)
+			g.recordProfit(filledPrice, buyPrice) // short: profit = (sellHigh - buyLow)
+			log.Info().
+				Float64("sell", filledPrice).
+				Float64("buy_close", buyPrice).
+				Msg("Both: sell filled → buy close placed")
+		}
+	} else {
+		// Buy filled → opened long → place Sell close above (reduceOnly)
+		sellPrice := g.findNextLevelUp(filledPrice)
+		if sellPrice > 0 {
+			g.placeOrderAt(sellPrice, exchange.Sell, true)
+			g.recordProfit(filledPrice, sellPrice) // long: profit = (sellHigh - buyLow)
+			log.Info().
+				Float64("buy", filledPrice).
+				Float64("sell_close", sellPrice).
+				Msg("Both: buy filled → sell close placed")
 		}
 	}
 }

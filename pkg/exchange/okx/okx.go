@@ -1046,17 +1046,20 @@ func (o *OKXExchange) handlePrivateWSMessage(msg []byte) {
 // handleOrderUpdate parses order fill events and dispatches to handlers.
 func (o *OKXExchange) handleOrderUpdate(data json.RawMessage) {
 	var orders []struct {
-		OrdID   string `json:"ordId"`
-		InstID  string `json:"instId"`
-		ClOrdID string `json:"clOrdId"`
-		Side    string `json:"side"`
-		OrdType string `json:"ordType"`
-		Px      string `json:"px"`
-		Sz      string `json:"sz"`
-		FillSz  string `json:"fillSz"`
-		FillPx  string `json:"avgPx"`
-		State   string `json:"state"`
-		TS      string `json:"uTime"`
+		OrdID    string `json:"ordId"`
+		InstID   string `json:"instId"`
+		ClOrdID  string `json:"clOrdId"`
+		Side     string `json:"side"`
+		OrdType  string `json:"ordType"`
+		Px       string `json:"px"`
+		Sz       string `json:"sz"`
+		FillSz   string `json:"fillSz"`
+		FillPx   string `json:"avgPx"`
+		Fee      string `json:"fee"`
+		FeeCcy   string `json:"feeCcy"`
+		PnL      string `json:"pnl"`
+		State    string `json:"state"`
+		TS       string `json:"uTime"`
 	}
 	if err := json.Unmarshal(data, &orders); err != nil {
 		return
@@ -1073,13 +1076,16 @@ func (o *OKXExchange) handleOrderUpdate(data json.RawMessage) {
 
 		ts, _ := strconv.ParseInt(ord.TS, 10, 64)
 		trade := exchange.Trade{
-			ID:        ord.OrdID,
-			OrderID:   ord.OrdID,
-			Pair:      convertInstID(ord.InstID),
-			Side:      exchange.OrderSide(ord.Side),
-			Price:     parseFloat(ord.FillPx),
-			Amount:    fillSz,
-			Timestamp: time.UnixMilli(ts),
+			ID:          ord.OrdID,
+			OrderID:     ord.OrdID,
+			Pair:        convertInstID(ord.InstID),
+			Side:        exchange.OrderSide(ord.Side),
+			Price:       parseFloat(ord.FillPx),
+			Amount:      fillSz,
+			Fee:         parseFloat(ord.Fee),
+			FeeCurrency: ord.FeeCcy,
+			PnL:         parseFloat(ord.PnL),
+			Timestamp:   time.UnixMilli(ts),
 		}
 
 		log.Info().

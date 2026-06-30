@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -68,7 +69,9 @@ type GridStrategy struct {
 	highPrice       float64
 	lowPrice        float64
 	gridLevels      int
-	quantityPerGrid float64
+	quantityPerGrid    float64
+	dynamicSizing      bool
+	dynamicMarginPct   float64
 	direction       Direction
 	effectiveDir    Direction
 	leverage        int
@@ -131,6 +134,12 @@ type GridStrategy struct {
 	paused           bool
 	startTime        time.Time
 	maxRuntime       time.Duration
+
+	// Independent AI signal polling (not dependent on OnTick)
+	aiPollStop chan struct{}
+
+	// State file path (absolute)
+	statePath string
 }
 
 func (g *GridStrategy) Name() string { return "grid" }
@@ -141,6 +150,8 @@ func (g *GridStrategy) Init(config map[string]interface{}, ex exchange.Exchange,
 	g.pair = strategy.GetStringParam(config, "pair", "BTC-USDT")
 	g.gridLevels = strategy.GetIntParam(config, "grid_levels", 15)
 	g.quantityPerGrid = strategy.GetFloatParam(config, "quantity_per_grid", 0.001)
+	g.dynamicSizing = strategy.GetBoolParam(config, "dynamic_sizing", false)
+	g.dynamicMarginPct = strategy.GetFloatParam(config, "dynamic_margin_pct", 0.40)
 	g.leverage = strategy.GetIntParam(config, "leverage", 3)
 
 	// Direction
@@ -159,6 +170,13 @@ func (g *GridStrategy) Init(config map[string]interface{}, ex exchange.Exchange,
 
 	// AI signal file path (default: same dir as binary)
 	g.aiSignalPath = strategy.GetStringParam(config, "ai_signal_path", "ai_signal.json")
+
+	// State file path — resolve to absolute based on executable directory
+	if exe, err := os.Executable(); err == nil {
+		g.statePath = filepath.Join(filepath.Dir(exe), "grid_state.json")
+	} else {
+		g.statePath = "grid_state.json"
+	}
 
 	// Geometric spacing (%)
 	g.spacingPct = strategy.GetFloatParam(config, "spacing_pct", 0)
@@ -211,6 +229,12 @@ func (g *GridStrategy) Init(config map[string]interface{}, ex exchange.Exchange,
 	// Get starting equity
 	g.startEquity = g.getEquity()
 
+	// Dynamic position sizing based on available balance
+	if g.dynamicSizing {
+		g.quantityPerGrid = g.calcQuantityPerGrid()
+		log.Info().Float64("qty_per_grid", g.quantityPerGrid).Msg("Dynamic sizing enabled")
+	}
+
 	// Calculate ATR & range
 	if err := g.calculateATR(); err != nil {
 		return fmt.Errorf("calculate ATR: %w", err)
@@ -258,6 +282,22 @@ func (g *GridStrategy) Init(config map[string]interface{}, ex exchange.Exchange,
 		Bool("volatility_filter", g.volatilityFilter).
 		Str("ai_signal_path", g.aiSignalPath).
 		Msg("Grid strategy initialized")
+
+	// Save initial state for crash recovery
+	log.Info().Str("state_path", g.statePath).Msg("Saving initial grid state")
+	if err := g.SaveState(); err != nil {
+		log.Warn().Err(err).Str("state_path", g.statePath).Msg("Failed to save initial grid state")
+	} else {
+		log.Info().Msg("Initial grid state saved successfully")
+	}
+
+	// Start independent AI signal polling (not dependent on OnTick/ticker)
+	if g.autoTrend {
+		g.aiPollStop = make(chan struct{})
+		go g.aiSignalPollLoop()
+		go g.autoShiftPollLoop()
+		log.Info().Msg("AI signal poll goroutine started (independent of ticker)")
+	}
 
 	return g.placeGridOrders()
 }
@@ -353,6 +393,90 @@ func (g *GridStrategy) loadAISignal() error {
 	return nil
 }
 
+// aiSignalPollLoop independently polls ai_signal.json every 5 minutes.
+// This ensures direction changes are detected even if OnTick stops firing
+// (e.g., public WS ticker disconnect).
+func (g *GridStrategy) aiSignalPollLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// Initial check after 30s (let startup settle)
+	select {
+	case <-time.After(30 * time.Second):
+	case <-g.aiPollStop:
+		return
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			raw, err := os.ReadFile(g.aiSignalPath)
+			if err != nil {
+				log.Debug().Err(err).Msg("[AI poll] signal file read failed")
+				continue
+			}
+			var peek struct {
+				Timestamp string `json:"timestamp"`
+			}
+			if json.Unmarshal(raw, &peek) != nil {
+				continue
+			}
+			g.aiMu.RLock()
+			lastTS := ""
+			if g.lastAISignal != nil {
+				lastTS = g.lastAISignal.Timestamp
+			}
+			g.aiMu.RUnlock()
+
+			if peek.Timestamp != lastTS {
+				log.Info().Str("new_ts", peek.Timestamp).Str("old_ts", lastTS).Msg("[AI poll] timestamp changed, reloading")
+				if err := g.loadAISignal(); err != nil {
+					log.Error().Err(err).Msg("[AI poll] loadAISignal failed")
+				}
+			}
+		case <-g.aiPollStop:
+			log.Info().Msg("[AI poll] goroutine stopped")
+			return
+		}
+	}
+}
+
+// autoShiftPollLoop independently checks price deviation via REST GetTicker every 2 minutes.
+// This ensures grid auto-shifts even if OnTick stops firing (public WS disconnect).
+func (g *GridStrategy) autoShiftPollLoop() {
+	pollTicker := time.NewTicker(2 * time.Minute)
+	defer pollTicker.Stop()
+
+	// Initial check after 60s (let startup settle)
+	select {
+	case <-time.After(60 * time.Second):
+	case <-g.aiPollStop:
+		return
+	}
+
+	for {
+		select {
+		case <-pollTicker.C:
+			if !g.autoShift || g.lastBuildPrice <= 0 {
+				continue
+			}
+			tk, err := g.Exchange().GetTicker(g.pair)
+			if err != nil {
+				log.Debug().Err(err).Msg("[autoShift poll] GetTicker failed")
+				continue
+			}
+			deviation := math.Abs(tk.Last-g.lastBuildPrice) / g.lastBuildPrice * 100
+			if deviation > g.shiftThreshold {
+				log.Info().Float64("deviation_pct", deviation).Float64("current", tk.Last).Float64("build_price", g.lastBuildPrice).Msg("[autoShift poll] Price shifted, rebuilding grid")
+				_ = g.rebuildGrid("auto_shift_poll")
+			}
+		case <-g.aiPollStop:
+			log.Info().Msg("[autoShift poll] goroutine stopped")
+			return
+		}
+	}
+}
+
 func (g *GridStrategy) saveAISignal(dir, reason string, confidence float64) error {
 	sig := AISignal{
 		Direction:  dir,
@@ -431,14 +555,53 @@ func (g *GridStrategy) calculateGridPrices() {
 	g.gridPrices = make([]float64, 0, g.gridLevels)
 	ratio := 1 + g.spacingPct/100
 
-	price := g.lowPrice
-	for i := 0; i < g.gridLevels; i++ {
+	// Center grid around current price for better coverage
+	// Use ticker if available, otherwise midpoint of range
+	center := g.lastBuildPrice
+	if center <= 0 {
+		center = (g.lowPrice + g.highPrice) / 2
+	}
+
+	// Place levels below center (buy zone)
+	lowPrices := make([]float64, 0)
+	price := center / ratio
+	for i := 0; i < g.gridLevels/2; i++ {
+		p := math.Round(price*100) / 100
+		if p >= g.lowPrice {
+			lowPrices = append(lowPrices, p)
+		}
+		price = price / ratio
+	}
+
+	// Place levels above center (sell zone)
+	highPrices := make([]float64, 0)
+	price = center * ratio
+	for i := 0; i < g.gridLevels/2; i++ {
 		p := math.Round(price*100) / 100
 		if p <= g.highPrice {
-			g.gridPrices = append(g.gridPrices, p)
+			highPrices = append(highPrices, p)
 		}
 		price = price * ratio
 	}
+
+	// Also include center itself
+	centerRounded := math.Round(center*100) / 100
+	g.gridPrices = append(g.gridPrices, lowPrices...)
+	g.gridPrices = append(g.gridPrices, centerRounded)
+	g.gridPrices = append(g.gridPrices, highPrices...)
+
+	// Deduplicate and sort
+	seen := make(map[float64]bool)
+	unique := make([]float64, 0, len(g.gridPrices))
+	for _, p := range g.gridPrices {
+		if !seen[p] {
+			seen[p] = true
+			unique = append(unique, p)
+		}
+	}
+	// Sort ascending
+	sort.Float64s(unique)
+	g.gridPrices = unique
 
 	if len(g.gridPrices) == 0 {
 		log.Warn().Float64("low", g.lowPrice).Float64("high", g.highPrice).Msg("Grid produced 0 levels, skipping")
@@ -983,6 +1146,15 @@ func (g *GridStrategy) OnFill(trade exchange.Trade) {
 		}
 	}
 
+	// Calculate net profit for this fill using actual fee from exchange
+	fillFee := trade.Fee // negative = you pay
+	fillPnL := trade.PnL // only non-zero for closing orders
+	netProfit := fillPnL + fillFee // gross PnL minus fee
+
+	// Accumulate real profit (closing fills have actual PnL, opening fills just have fee)
+	g.profit += netProfit
+	g.totalTrades++
+
 	g.notify(notifType, GridNotification{
 		Type:      notifType,
 		Pair:      g.pair,
@@ -990,7 +1162,7 @@ func (g *GridStrategy) OnFill(trade exchange.Trade) {
 		Side:      side,
 		Amount:    g.quantityPerGrid,
 		PnL:       math.Round(g.profit*100) / 100,
-		Reason:    fmt.Sprintf("网格成交 %s %.4f @ %.2f | 累计利润: %.2f | 交易次数: %d", side, g.quantityPerGrid, filledPrice, g.profit, g.totalTrades),
+		Reason:    fmt.Sprintf("网格成交 %s %.4f @ %.2f | 本次净利: %.4f (PnL:%.4f Fee:%.4f) | 累计利润: %.2f | 第%d次", side, g.quantityPerGrid, filledPrice, netProfit, fillPnL, fillFee, g.profit, g.totalTrades),
 		Direction: string(g.effectiveDir),
 	})
 
@@ -1023,11 +1195,9 @@ func (g *GridStrategy) handleLongFill(trade exchange.Trade, filledPrice float64)
 		sellPrice := g.findNextLevelUp(filledPrice)
 		if sellPrice > 0 {
 			g.placeOrderAt(sellPrice, exchange.Sell, true)
-			g.recordProfit(filledPrice, sellPrice)
 			log.Info().
 				Float64("buy", filledPrice).
 				Float64("sell_close", sellPrice).
-				Float64("profit", g.profit).
 				Msg("Long: buy filled → sell close placed")
 		}
 	} else {
@@ -1047,12 +1217,9 @@ func (g *GridStrategy) handleShortFill(trade exchange.Trade, filledPrice float64
 		buyPrice := g.findNextLevelDown(filledPrice)
 		if buyPrice > 0 {
 			g.placeOrderAt(buyPrice, exchange.Buy, true)
-			// entry=sell@filledPrice(high), exit=buy@buyPrice(low) → recordProfit(high, low)
-			g.recordProfit(filledPrice, buyPrice)
 			log.Info().
 				Float64("sell", filledPrice).
 				Float64("buy_close", buyPrice).
-				Float64("profit", g.profit).
 				Msg("Short: sell filled → buy close placed")
 		}
 	} else {
@@ -1073,7 +1240,6 @@ func (g *GridStrategy) handleBothFill(trade exchange.Trade, filledPrice float64)
 		buyPrice := g.findNextLevelDown(filledPrice)
 		if buyPrice > 0 {
 			g.placeOrderAt(buyPrice, exchange.Buy, true)
-			g.recordProfit(filledPrice, buyPrice) // short: profit = (sellHigh - buyLow)
 			log.Info().
 				Float64("sell", filledPrice).
 				Float64("buy_close", buyPrice).
@@ -1084,7 +1250,6 @@ func (g *GridStrategy) handleBothFill(trade exchange.Trade, filledPrice float64)
 		sellPrice := g.findNextLevelUp(filledPrice)
 		if sellPrice > 0 {
 			g.placeOrderAt(sellPrice, exchange.Sell, true)
-			g.recordProfit(filledPrice, sellPrice) // long: profit = (sellHigh - buyLow)
 			log.Info().
 				Float64("buy", filledPrice).
 				Float64("sell_close", sellPrice).
@@ -1197,6 +1362,66 @@ func (g *GridStrategy) getEquityCached() float64 {
 	return g.equityCache
 }
 
+// calcQuantityPerGrid calculates quantity per grid level based on available balance.
+// Formula: availBal × marginPct × leverage / (gridLevels × currentPrice)
+// marginPct controls how much of available balance to allocate (default 40%).
+func (g *GridStrategy) calcQuantityPerGrid() float64 {
+	bals, err := g.Exchange().GetBalance("USDT")
+	if err != nil || len(bals) == 0 {
+		log.Warn().Err(err).Msg("calcQuantityPerGrid: failed to get balance, using config value")
+		return g.quantityPerGrid
+	}
+	availBal := bals[0].Available
+	if availBal <= 0 {
+		log.Warn().Float64("avail", availBal).Msg("calcQuantityPerGrid: no available balance")
+		return g.quantityPerGrid
+	}
+
+	ticker, err := g.Exchange().GetTicker(g.pair)
+	if err != nil {
+		log.Warn().Err(err).Msg("calcQuantityPerGrid: failed to get ticker")
+		return g.quantityPerGrid
+	}
+	price := ticker.Last
+	if price <= 0 {
+		return g.quantityPerGrid
+	}
+
+	// marginPct: fraction of available balance to use (default 40%)
+	marginPct := 0.40
+	if g.dynamicMarginPct > 0 {
+		marginPct = g.dynamicMarginPct
+	}
+
+	// Total position = availBal × marginPct × leverage
+	// Per grid = total / gridLevels / price
+	totalNotional := availBal * marginPct * float64(g.leverage)
+	qty := totalNotional / (float64(g.gridLevels) * price)
+
+	// Apply safety cap: max 90% of available balance
+	maxQty := (availBal * 0.90 * float64(g.leverage)) / (float64(g.gridLevels) * price)
+	if qty > maxQty {
+		qty = maxQty
+	}
+
+	// Round to OKX min precision (0.1 for SOL)
+	qty = math.Floor(qty*10) / 10
+	if qty < 0.1 {
+		qty = 0.1
+	}
+
+	log.Info().
+		Float64("avail_bal", availBal).
+		Float64("margin_pct", marginPct).
+		Float64("price", price).
+		Int("grid_levels", g.gridLevels).
+		Int("leverage", g.leverage).
+		Float64("qty_per_grid", qty).
+		Msg("Dynamic position sizing calculated")
+
+	return qty
+}
+
 // calcStopLoss returns direction-aware stop-loss price.
 // Short: SL above grid (price rises = loss). Long: SL below grid (price drops = loss).
 func (g *GridStrategy) calcStopLoss() float64 {
@@ -1300,6 +1525,16 @@ func (g *GridStrategy) rebuildGrid(reason string) error {
 	}
 
 	g.stopLossPrice = g.calcStopLoss()
+
+	// Recalculate quantity per grid if dynamic sizing enabled
+	if g.dynamicSizing {
+		oldQty := g.quantityPerGrid
+		g.quantityPerGrid = g.calcQuantityPerGrid()
+		if g.quantityPerGrid != oldQty {
+			log.Info().Float64("old_qty", oldQty).Float64("new_qty", g.quantityPerGrid).Msg("Dynamic sizing updated on rebuild")
+		}
+	}
+
 	g.calculateGridPrices()
 	g.rebuildCount++
 
@@ -1319,6 +1554,10 @@ func (g *GridStrategy) rebuildGrid(reason string) error {
 }
 
 func (g *GridStrategy) Stop() {
+	// Stop AI poll goroutine
+	if g.aiPollStop != nil {
+		close(g.aiPollStop)
+	}
 	for orderID := range g.activeOrders {
 		_ = g.Exchange().CancelOrder(g.pair, orderID)
 	}
@@ -1574,7 +1813,7 @@ func (g *GridStrategy) SaveState() error {
 		LowPrice      float64            `json:"low_price"`
 		SpacingPct    float64            `json:"spacing_pct"`
 		EffectiveDir  string             `json:"effective_dir"`
-		Orders        map[float64]string `json:"orders"`
+		Orders        map[string]string  `json:"orders"`
 		ActiveOrders  map[string]bool    `json:"active_orders"`
 		Profit        float64            `json:"profit"`
 		TotalTrades   int                `json:"total_trades"`
@@ -1585,13 +1824,19 @@ func (g *GridStrategy) SaveState() error {
 		RebuildCount  int                `json:"rebuild_count"`
 	}
 
+	// Convert float64 keys to string for JSON compatibility
+	ordersStr := make(map[string]string, len(g.orders))
+	for k, v := range g.orders {
+		ordersStr[fmt.Sprintf("%.2f", k)] = v
+	}
+
 	state := GridState{
 		Pair:          g.pair,
 		HighPrice:     g.highPrice,
 		LowPrice:      g.lowPrice,
 		SpacingPct:    g.spacingPct,
 		EffectiveDir:  string(g.effectiveDir),
-		Orders:        g.orders,
+		Orders:        ordersStr,
 		ActiveOrders:  g.activeOrders,
 		Profit:        g.profit,
 		TotalTrades:   g.totalTrades,
@@ -1606,12 +1851,12 @@ func (g *GridStrategy) SaveState() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile("grid_state.json", data, 0644)
+	return os.WriteFile(g.statePath, data, 0644)
 }
 
 // LoadState restores grid state from saved JSON file.
 func (g *GridStrategy) LoadState() error {
-	data, err := os.ReadFile("grid_state.json")
+	data, err := os.ReadFile(g.statePath)
 	if err != nil {
 		return err
 	}

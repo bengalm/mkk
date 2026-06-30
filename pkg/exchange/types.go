@@ -60,15 +60,16 @@ type Order struct {
 
 // Trade represents a completed trade/fill.
 type Trade struct {
-	ID        string    `json:"id"`
-	OrderID   string    `json:"order_id"`
-	Pair      string    `json:"pair"`
-	Side      OrderSide `json:"side"`
-	Price     float64   `json:"price"`
-	Amount    float64   `json:"amount"`
-	Fee       float64   `json:"fee"`
-	FeeCurrency string  `json:"fee_currency"`
-	Timestamp time.Time `json:"timestamp"`
+	ID          string    `json:"id"`
+	OrderID     string    `json:"order_id"`
+	Pair        string    `json:"pair"`
+	Side        OrderSide `json:"side"`
+	Price       float64   `json:"price"`
+	Amount      float64   `json:"amount"`
+	Fee         float64   `json:"fee"`
+	FeeCurrency string    `json:"fee_currency"`
+	PnL         float64   `json:"pnl"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 // Position represents an open position.
